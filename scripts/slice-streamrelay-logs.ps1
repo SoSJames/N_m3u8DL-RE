@@ -101,3 +101,5 @@ Write-Host "  $indexPath"
 Write-Host "  $contextPath"
 Write-Host "  $tailPath"
 Write-Host "Matches: $($hits.Count); source lines: $($lines.Count)"
+
+# Standalone workflow trigger marker.
