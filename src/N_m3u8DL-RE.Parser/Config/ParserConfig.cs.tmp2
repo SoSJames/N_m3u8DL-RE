@@ -1,0 +1,24 @@
+using N_m3u8DL_RE.Common.Enum;
+using N_m3u8DL_RE.Parser.Processor;
+using N_m3u8DL_RE.Parser.Processor.DASH;
+using N_m3u8DL_RE.Parser.Processor.HLS;
+
+namespace N_m3u8DL_RE.Parser.Config;
+
+public class ParserConfig
+{
+    public string Url { get; set; } = string.Empty;
+    public string OriginalUrl { get; set; } = string.Empty;
+    public string BaseUrl { get; set; } = string.Empty;
+    public Dictionary<string, string> CustomParserArgs { get; } = new();
+    public Dictionary<string, string> Headers { get; init; } = new();
+    public IList<ContentProcessor> ContentProcessors { get; } = new List<ContentProcessor>() { new DefaultBOMContentProcessor(), new DefaultHLSContentProcessor(), new DefaultDASHContentProcessor(), new LiveManifestCaptureProcessor() };
+    public IList<UrlProcessor> UrlProcessors { get; } = new List<UrlProcessor>() { new DefaultUrlProcessor() };
+    public IList<KeyProcessor> KeyProcessors { get; } = new List<KeyProcessor>() { new DefaultHLSKeyProcessor() };
+    public EncryptMethod? CustomMethod { get; set; }
+    public byte[]? CustomeKey { get; set; }
+    public byte[]? CustomeIV { get; set; }
+    public bool AppendUrlParams { get; set; } = false;
+    public string? UrlProcessorArgs { get; set; }
+    public int KeyRetryCount { get; set; } = 3;
+}
