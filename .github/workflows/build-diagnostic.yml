@@ -20,13 +20,11 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-          import re
           import subprocess
 
           path = Path("src/N_m3u8DL-RE.Parser/Extractor/DASHExtractor2.cs")
           text = path.read_text(encoding="utf-8-sig")
 
-          marker = "[StreamRelay] Prefer newest live DASH Period"
           changed = False
 
           old_live = '''                    if (isLive)\n                    {\n                        // 直播，这种情况直接略过新的\n                    }\n                    else'''
@@ -58,7 +56,7 @@ jobs:
               subprocess.run(["git", "commit", "-m", "Fix live DASH Period handoff"], check=True)
               subprocess.run(["git", "push"], check=True)
           else:
-              print("Live DASH Period patch already applied or source layout changed; continuing without commit.")
+              print("Live DASH Period patch already applied; continuing with rebuild.")
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
