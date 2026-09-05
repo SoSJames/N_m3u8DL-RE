@@ -25,7 +25,13 @@ new_live = '''                        if (isLive)
                         {
                             // Live MPDs can overlap Periods at ad/content boundaries.
                             // Prefer the newest Period so refreshes follow the active timeline.
-                            Logger.Debug($"[DASH] Prefer newest live Period for {streamSpec.GroupId} ({streamSpec.MediaType}, {streamSpec.Resolution})");
+                            var oldSpec = streamList[_index];
+                            var oldInit = oldSpec.Playlist?.MediaInit?.Url ?? "";
+                            var newInit = streamSpec.Playlist?.MediaInit?.Url ?? "";
+                            var oldKid = oldSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";
+                            var newKid = streamSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";
+                            var newParts = streamSpec.Playlist?.MediaParts.FirstOrDefault()?.MediaSegments.Count ?? 0;
+                            Logger.Debug($"[DASH][LIVE-TRANSITION] {streamSpec.MediaType} {streamSpec.Resolution} Group={streamSpec.GroupId} Period {oldSpec.PeriodId} -> {streamSpec.PeriodId}; Init {oldInit} -> {newInit}; KID {oldKid} -> {newKid}; Parts={newParts}");
                             streamList[_index] = streamSpec;
                         }'''
 if old_live in dash:
@@ -62,12 +68,13 @@ if "string observedPeriodId = \"\";" not in manager:
             var incomingPeriodId = streamSpec.PeriodId ?? "";
             var incomingInitUrl = streamSpec.Playlist?.MediaInit?.Url ?? "";
             var incomingMpdKid = streamSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";
+            Logger.Debug($"[LIVE][BATCH] {streamSpec.MediaType} Group={streamSpec.GroupId} Period={incomingPeriodId} Init={incomingInitUrl} KID={incomingMpdKid} Parts={segments.Count()}");
             if (!string.IsNullOrEmpty(observedPeriodId) &&
                 (incomingPeriodId != observedPeriodId ||
                  incomingInitUrl != observedInitUrl ||
                  (!string.IsNullOrEmpty(incomingMpdKid) && incomingMpdKid != observedMpdKid)))
             {
-                Logger.WarnMarkUp($"[LIVE] DASH Period/init change: {observedPeriodId} -> {incomingPeriodId}; resetting fMP4 init/decryption context.");
+                Logger.WarnMarkUp($"[LIVE] DASH Period/init change: {observedPeriodId} -> {incomingPeriodId}; Init {observedInitUrl} -> {incomingInitUrl}; KID {observedMpdKid} -> {incomingMpdKid}; resetting fMP4 init/decryption context.");
                 initDownloaded = false;
                 mp4InitFile = "";
                 currentKID = "";
@@ -84,4 +91,4 @@ if "string observedPeriodId = \"\";" not in manager:
     manager = manager.replace(old_batch, new_batch, 1)
 
 MANAGER.write_text(manager, encoding="utf-8")
-print("Applied surgical live DASH Period handoff plus Period-scoped fMP4 init/KID reset; recorder resilience injection remains disabled.")
+print("Applied surgical live DASH Period handoff plus diagnostic Period/init/KID logging; recorder resilience injection remains disabled.")
