@@ -24,28 +24,18 @@ jobs:
 
           path = Path("src/N_m3u8DL-RE.Parser/Extractor/DASHExtractor2.cs")
           text = path.read_text(encoding="utf-8-sig")
-
           changed = False
 
-          old_live = '''                    if (isLive)\n                    {\n                        // 直播，这种情况直接略过新的\n                    }\n                    else'''
-          new_live = '''                    if (isLive)\n                    {\n                        // Live MPDs can overlap Periods at ad/content boundaries.\n                        // Prefer the newest Period so refreshes follow the active timeline.\n                        Logger.Debug($"[StreamRelay] Prefer newest live DASH Period for {streamSpec.GroupId} ({streamSpec.MediaType}, {streamSpec.Resolution})");\n                        streamList[_index] = streamSpec;\n                    }\n                    else'''
+          old_index = '                    var _index = streamList.FindIndex(_f => _f.PeriodId != streamSpec.PeriodId && _f.GroupId == streamSpec.GroupId && _f.Resolution == streamSpec.Resolution && _f.MediaType == streamSpec.MediaType);'
+          new_index = '''                    var _index = streamList.FindIndex(_f =>\n                        _f.PeriodId != streamSpec.PeriodId &&\n                        _f.MediaType == streamSpec.MediaType &&\n                        _f.Resolution == streamSpec.Resolution &&\n                        (_f.GroupId == streamSpec.GroupId || (isLive && IsSameLogicalLiveTrack(_f, streamSpec))));'''
+          if old_index in text:
+              text = text.replace(old_index, new_index, 1)
+              changed = True
+
+          old_live = '''                        if (isLive)\n                        {\n                            // 直播，这种情况直接略过新的\n                        }'''
+          new_live = '''                        if (isLive)\n                        {\n                            // Live MPDs can overlap Periods at ad/content boundaries.\n                            // Prefer the newest Period so auto-selection and refreshes follow\n                            // the active timeline instead of retaining the stale Period.\n                            Logger.Debug($"[StreamRelay] Prefer newest live DASH Period for {streamSpec.GroupId} ({streamSpec.MediaType}, {streamSpec.Resolution})");\n                            streamList[_index] = streamSpec;\n                        }'''
           if old_live in text:
               text = text.replace(old_live, new_live, 1)
-              changed = True
-
-          helper = '''\n    private static bool IsSameLogicalLiveTrack(StreamSpec left, StreamSpec right)\n    {\n        if (left.MediaType != right.MediaType) return false;\n        if (!string.Equals(left.Resolution, right.Resolution, StringComparison.Ordinal)) return false;\n        if (!string.Equals(left.Language, right.Language, StringComparison.OrdinalIgnoreCase)) return false;\n        if (left.Role != right.Role) return false;\n        if (!string.Equals(left.Codecs, right.Codecs, StringComparison.OrdinalIgnoreCase)) return false;\n        if (left.MediaType == MediaType.VIDEO && left.FrameRate.HasValue && right.FrameRate.HasValue && Math.Abs(left.FrameRate.Value - right.FrameRate.Value) > 0.01) return false;\n        return true;\n    }\n'''
-
-          if "private static bool IsSameLogicalLiveTrack" not in text:
-              anchor = "    private string? FilterLanguage(string? v)"
-              if anchor not in text:
-                  raise SystemExit("Could not find DASHExtractor2 helper insertion point")
-              text = text.replace(anchor, helper + "\n" + anchor, 1)
-              changed = True
-
-          old_refresh = '''            if (!match.Any())\n                match = newStreams.Where(n => n.Playlist?.MediaInit?.Url == streamSpec.Playlist?.MediaInit?.Url);\n\n            if (match.Any())\n                streamSpec.Playlist!.MediaParts = match.First().Playlist!.MediaParts; // 不更新init'''
-          new_refresh = '''            if (!match.Any())\n                match = newStreams.Where(n => n.Playlist?.MediaInit?.Url == streamSpec.Playlist?.MediaInit?.Url);\n\n            // At a live Period boundary the representation ID/init URL may change even\n            // though this is the same logical audio/video track. Match by stable track\n            // properties and use the newest Period selected by ExtractStreamsAsync.\n            if (!match.Any() && streamSpec.Playlist?.IsLive == true)\n                match = newStreams.Where(n => IsSameLogicalLiveTrack(streamSpec, n));\n\n            if (match.Any())\n            {\n                var matched = match.Last();\n                streamSpec.PeriodId = matched.PeriodId;\n                streamSpec.Playlist!.MediaInit = matched.Playlist!.MediaInit;\n                streamSpec.Playlist.MediaParts = matched.Playlist.MediaParts;\n            }'''
-          if old_refresh in text:
-              text = text.replace(old_refresh, new_refresh, 1)
               changed = True
 
           if changed:
@@ -53,10 +43,10 @@ jobs:
               subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
               subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
               subprocess.run(["git", "add", str(path)], check=True)
-              subprocess.run(["git", "commit", "-m", "Fix live DASH Period handoff"], check=True)
+              subprocess.run(["git", "commit", "-m", "Prefer newest live DASH Period"], check=True)
               subprocess.run(["git", "push"], check=True)
           else:
-              print("Live DASH Period patch already applied; continuing with rebuild.")
+              print("Live DASH Period deduplication patch already applied; continuing with rebuild.")
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
