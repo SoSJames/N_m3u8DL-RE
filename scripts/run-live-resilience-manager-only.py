@@ -39,45 +39,50 @@ if old_live in dash:
 
 DASH.write_text(dash, encoding="utf-8")
 
-# A live DASH Period can change the initialization segment and/or default_KID
-# without ending the recording. Reset only the fMP4 initialization/decryption
-# context so the next batch downloads the new init and resolves its key.
+# Period identity and fMP4 initialization identity are deliberately separate.
+# A Period-only transition may reuse the exact same init URL; in that case the
+# existing init/decryption context must remain intact. When the init URL or MPD
+# KID changes, use a new context-specific init path so _init_dec files cannot
+# collide with the previous context.
 manager = MANAGER.read_text(encoding="utf-8-sig")
 
-if "string observedPeriodId = \"\";" not in manager:
-    old_state = '''        bool initDownloaded = false; // 是否下载过init文件
+old_state = '''        bool initDownloaded = false; // 是否下载过init文件
         ConcurrentDictionary<MediaSegment, DownloadResult?> FileDic = new();'''
-    new_state = '''        bool initDownloaded = false; // 是否下载过init文件
+new_state = '''        bool initDownloaded = false; // 是否下载过init文件
         string observedPeriodId = "";
         string observedInitUrl = "";
         string observedMpdKid = "";
+        string initContextKey = "";
         ConcurrentDictionary<MediaSegment, DownloadResult?> FileDic = new();'''
-    if old_state not in manager:
-        raise RuntimeError("SimpleLiveRecordManager2.cs init state anchor not found")
+if old_state in manager and "string initContextKey = \"\";" not in manager:
     manager = manager.replace(old_state, new_state, 1)
 
-    old_batch = '''            var segmentsDuration = segments.Sum(s => s.Duration);
+old_batch = '''            var segmentsDuration = segments.Sum(s => s.Duration);
             Logger.DebugMarkUp(string.Join(",", segments.Select(sss => GetSegmentName(sss, false, false))));
 
             // 下载init'''
-    new_batch = '''            var segmentsDuration = segments.Sum(s => s.Duration);
+new_batch = '''            var segmentsDuration = segments.Sum(s => s.Duration);
 
-            // Live DASH ad/content boundaries can switch Period, initialization
-            // segment, and/or default_KID while the recorder remains alive.
-            // The old init/decryption context must not be reused across that boundary.
             var incomingPeriodId = streamSpec.PeriodId ?? "";
             var incomingInitUrl = streamSpec.Playlist?.MediaInit?.Url ?? "";
             var incomingMpdKid = streamSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";
+            var initUrlChanged = incomingInitUrl != observedInitUrl;
+            var mpdKidChanged = incomingMpdKid != observedMpdKid;
+            var periodChanged = !string.IsNullOrEmpty(observedPeriodId) && incomingPeriodId != observedPeriodId;
             Logger.Debug($"[LIVE][BATCH] {streamSpec.MediaType} Group={streamSpec.GroupId} Period={incomingPeriodId} Init={incomingInitUrl} KID={incomingMpdKid} Parts={segments.Count()}");
-            if (!string.IsNullOrEmpty(observedPeriodId) &&
-                (incomingPeriodId != observedPeriodId ||
-                 incomingInitUrl != observedInitUrl ||
-                 (!string.IsNullOrEmpty(incomingMpdKid) && incomingMpdKid != observedMpdKid)))
+            if (periodChanged)
             {
-                Logger.WarnMarkUp($"[LIVE] DASH Period/init change: {observedPeriodId} -> {incomingPeriodId}; Init {observedInitUrl} -> {incomingInitUrl}; KID {observedMpdKid} -> {incomingMpdKid}; resetting fMP4 init/decryption context.");
+                Logger.WarnMarkUp($"[LIVE] DASH Period change: {observedPeriodId} -> {incomingPeriodId}; Init {observedInitUrl} -> {incomingInitUrl}; KID {observedMpdKid} -> {incomingMpdKid}; initContextChanged={initUrlChanged || mpdKidChanged}");
+            }
+            // A Period change by itself is not an initialization change. The
+            // previous diagnostic crash occurred because a new Period reused the
+            // same init URL and the recorder tried to write _init_dec.mp4 again.
+            if (initUrlChanged || mpdKidChanged)
+            {
                 initDownloaded = false;
                 mp4InitFile = "";
                 currentKID = "";
+                initContextKey = "";
             }
             observedPeriodId = incomingPeriodId;
             observedInitUrl = incomingInitUrl;
@@ -86,9 +91,18 @@ if "string observedPeriodId = \"\";" not in manager:
             Logger.DebugMarkUp(string.Join(",", segments.Select(sss => GetSegmentName(sss, false, false))));
 
             // 下载init'''
-    if old_batch not in manager:
-        raise RuntimeError("SimpleLiveRecordManager2.cs live batch anchor not found")
+if old_batch in manager:
     manager = manager.replace(old_batch, new_batch, 1)
 
+old_path = '                var path = Path.Combine(tmpDir, "_init.mp4.tmp");'
+new_path = '''                if (string.IsNullOrEmpty(initContextKey))
+                {
+                    var contextBytes = System.Text.Encoding.UTF8.GetBytes($"{incomingInitUrl}\\n{incomingMpdKid}");
+                    initContextKey = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(contextBytes)).ToLowerInvariant()[..16];
+                }
+                var path = Path.Combine(tmpDir, $"_init_{initContextKey}.mp4.tmp");'''
+if old_path in manager:
+    manager = manager.replace(old_path, new_path, 1)
+
 MANAGER.write_text(manager, encoding="utf-8")
-print("Applied surgical live DASH Period handoff plus diagnostic Period/init/KID logging; recorder resilience injection remains disabled.")
+print("Applied live DASH Period handoff plus init-context-aware recorder handling; Period-only changes now reuse the existing init, while init/KID changes get a unique init/decryption path.")
