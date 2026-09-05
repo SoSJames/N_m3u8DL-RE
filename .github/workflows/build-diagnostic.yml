@@ -21,7 +21,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Apply live resilience changes
-        shell: python
         run: python scripts/apply-live-resilience-v2.py
 
       - name: Set up .NET
