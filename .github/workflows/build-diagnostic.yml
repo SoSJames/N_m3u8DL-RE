@@ -26,7 +26,9 @@ jobs:
           dotnet-version: "10.0.300"
 
       - name: Apply live resilience changes
-        run: python scripts/run-live-resilience-manager-only.py
+        run: |
+          python scripts/run-live-resilience-manager-only.py
+          python scripts/run-live-init-alias-patch.py
 
       - name: Install LLVM linker
         run: |
