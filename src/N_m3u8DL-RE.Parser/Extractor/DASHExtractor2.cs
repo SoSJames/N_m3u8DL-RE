@@ -566,6 +566,18 @@ internal partial class DASHExtractor2 : IExtractor
     /// </summary>
     /// <param name="v"></param>
     /// <returns></returns>
+
+    private static bool IsSameLogicalLiveTrack(StreamSpec left, StreamSpec right)
+    {
+        if (left.MediaType != right.MediaType) return false;
+        if (!string.Equals(left.Resolution, right.Resolution, StringComparison.Ordinal)) return false;
+        if (!string.Equals(left.Language, right.Language, StringComparison.OrdinalIgnoreCase)) return false;
+        if (left.Role != right.Role) return false;
+        if (!string.Equals(left.Codecs, right.Codecs, StringComparison.OrdinalIgnoreCase)) return false;
+        if (left.MediaType == MediaType.VIDEO && left.FrameRate.HasValue && right.FrameRate.HasValue && Math.Abs(left.FrameRate.Value - right.FrameRate.Value) > 0.01) return false;
+        return true;
+    }
+
     private string? FilterLanguage(string? v)
     {
         if (v == null) return null;
@@ -599,8 +611,19 @@ internal partial class DASHExtractor2 : IExtractor
             if (!match.Any())
                 match = newStreams.Where(n => n.Playlist?.MediaInit?.Url == streamSpec.Playlist?.MediaInit?.Url);
 
+            // At a live Period boundary the representation ID/init URL may change even
+            // though this is the same logical audio/video track. Match by stable track
+            // properties and use the newest Period selected by ExtractStreamsAsync.
+            if (!match.Any() && streamSpec.Playlist?.IsLive == true)
+                match = newStreams.Where(n => IsSameLogicalLiveTrack(streamSpec, n));
+
             if (match.Any())
-                streamSpec.Playlist!.MediaParts = match.First().Playlist!.MediaParts; // 不更新init
+            {
+                var matched = match.Last();
+                streamSpec.PeriodId = matched.PeriodId;
+                streamSpec.Playlist!.MediaInit = matched.Playlist!.MediaInit;
+                streamSpec.Playlist.MediaParts = matched.Playlist.MediaParts;
+            }
         }
         // 这里才调用URL预处理器，节省开销
         await ProcessUrlAsync(streamSpecs);
