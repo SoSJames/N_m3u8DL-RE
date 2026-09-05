@@ -59,25 +59,22 @@ if "string observedPeriodId = \"\";" not in manager:
             // Live DASH ad/content boundaries can switch Period, initialization
             // segment, and/or default_KID while the recorder remains alive.
             // The old init/decryption context must not be reused across that boundary.
-            if (StreamExtractor.ExtractorType == ExtractorType.DASH)
+            var incomingPeriodId = streamSpec.PeriodId ?? "";
+            var incomingInitUrl = streamSpec.Playlist?.MediaInit?.Url ?? "";
+            var incomingMpdKid = streamSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";
+            if (!string.IsNullOrEmpty(observedPeriodId) &&
+                (incomingPeriodId != observedPeriodId ||
+                 incomingInitUrl != observedInitUrl ||
+                 (!string.IsNullOrEmpty(incomingMpdKid) && incomingMpdKid != observedMpdKid)))
             {
-                var incomingPeriodId = streamSpec.PeriodId ?? "";
-                var incomingInitUrl = streamSpec.Playlist?.MediaInit?.Url ?? "";
-                var incomingMpdKid = streamSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";
-                if (!string.IsNullOrEmpty(observedPeriodId) &&
-                    (incomingPeriodId != observedPeriodId ||
-                     incomingInitUrl != observedInitUrl ||
-                     (!string.IsNullOrEmpty(incomingMpdKid) && incomingMpdKid != observedMpdKid)))
-                {
-                    Logger.WarnMarkUp($"[LIVE] DASH Period/init change: {observedPeriodId} -> {incomingPeriodId}; resetting fMP4 init/decryption context.");
-                    initDownloaded = false;
-                    mp4InitFile = "";
-                    currentKID = "";
-                }
-                observedPeriodId = incomingPeriodId;
-                observedInitUrl = incomingInitUrl;
-                observedMpdKid = incomingMpdKid;
+                Logger.WarnMarkUp($"[LIVE] DASH Period/init change: {observedPeriodId} -> {incomingPeriodId}; resetting fMP4 init/decryption context.");
+                initDownloaded = false;
+                mp4InitFile = "";
+                currentKID = "";
             }
+            observedPeriodId = incomingPeriodId;
+            observedInitUrl = incomingInitUrl;
+            observedMpdKid = incomingMpdKid;
 
             Logger.DebugMarkUp(string.Join(",", segments.Select(sss => GetSegmentName(sss, false, false))));
 
