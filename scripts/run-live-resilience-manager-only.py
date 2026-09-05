@@ -42,8 +42,9 @@ DASH.write_text(dash, encoding="utf-8")
 # Period identity and fMP4 initialization identity are deliberately separate.
 # A Period-only transition may reuse the exact same init URL; in that case the
 # existing init/decryption context must remain intact. When the init URL or MPD
-# KID changes, use a new context-specific init path so _init_dec files cannot
-# collide with the previous context.
+# KID changes, isolate the new init/decryption context in its own directory.
+# Keep the standard _init.mp4 / _init_dec.mp4 names because StreamRelay discovers
+# decrypted fMP4 tracks by those names recursively.
 manager = MANAGER.read_text(encoding="utf-8-sig")
 
 old_state = '''        bool initDownloaded = false; // 是否下载过init文件
@@ -54,7 +55,7 @@ new_state = '''        bool initDownloaded = false; // 是否下载过init文件
         string observedMpdKid = "";
         string initContextKey = "";
         ConcurrentDictionary<MediaSegment, DownloadResult?> FileDic = new();'''
-if old_state in manager and "string initContextKey = \"\";" not in manager:
+if old_state in manager and 'string initContextKey = "";' not in manager:
     manager = manager.replace(old_state, new_state, 1)
 
 old_batch = '''            var segmentsDuration = segments.Sum(s => s.Duration);
@@ -94,15 +95,19 @@ new_batch = '''            var segmentsDuration = segments.Sum(s => s.Duration);
 if old_batch in manager:
     manager = manager.replace(old_batch, new_batch, 1)
 
-old_path = '                var path = Path.Combine(tmpDir, "_init.mp4.tmp");'
+old_path = '                var path = Path.Combine(tmpDir, $"_init_{initContextKey}.mp4.tmp");'
+if old_path not in manager:
+    old_path = '                var path = Path.Combine(tmpDir, "_init.mp4.tmp");'
 new_path = '''                if (string.IsNullOrEmpty(initContextKey))
                 {
                     var contextBytes = System.Text.Encoding.UTF8.GetBytes($"{incomingInitUrl}\\n{incomingMpdKid}");
                     initContextKey = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(contextBytes)).ToLowerInvariant()[..16];
                 }
-                var path = Path.Combine(tmpDir, $"_init_{initContextKey}.mp4.tmp");'''
+                var contextDir = Path.Combine(tmpDir, $"init-context-{initContextKey}");
+                Directory.CreateDirectory(contextDir);
+                var path = Path.Combine(contextDir, "_init.mp4.tmp");'''
 if old_path in manager:
     manager = manager.replace(old_path, new_path, 1)
 
 MANAGER.write_text(manager, encoding="utf-8")
-print("Applied live DASH Period handoff plus init-context-aware recorder handling; Period-only changes now reuse the existing init, while init/KID changes get a unique init/decryption path.")
+print("Applied live DASH Period handoff plus init-context-aware recorder handling; Period-only changes now reuse the existing init, while init/KID changes get a unique context directory containing standard _init.mp4/_init_dec.mp4 filenames.")
