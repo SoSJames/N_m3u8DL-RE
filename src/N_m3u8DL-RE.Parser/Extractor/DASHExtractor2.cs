@@ -490,12 +490,20 @@ internal partial class DASHExtractor2 : IExtractor
                     }
 
                     // 处理同一ID分散在不同Period的情况
-                    var _index = streamList.FindIndex(_f => _f.PeriodId != streamSpec.PeriodId && _f.GroupId == streamSpec.GroupId && _f.Resolution == streamSpec.Resolution && _f.MediaType == streamSpec.MediaType);
+                    var _index = streamList.FindIndex(_f =>
+                        _f.PeriodId != streamSpec.PeriodId &&
+                        _f.MediaType == streamSpec.MediaType &&
+                        _f.Resolution == streamSpec.Resolution &&
+                        (_f.GroupId == streamSpec.GroupId || (isLive && IsSameLogicalLiveTrack(_f, streamSpec))));
                     if (_index > -1)
                     {
                         if (isLive)
                         {
-                            // 直播，这种情况直接略过新的
+                            // Live MPDs can overlap Periods at ad/content boundaries.
+                            // Prefer the newest Period so auto-selection and refreshes follow
+                            // the active timeline instead of retaining the stale Period.
+                            Logger.Debug($"[StreamRelay] Prefer newest live DASH Period for {streamSpec.GroupId} ({streamSpec.MediaType}, {streamSpec.Resolution})");
+                            streamList[_index] = streamSpec;
                         }
                         else
                         {
