@@ -20,25 +20,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply live resilience changes
-        run: python scripts/run-live-resilience-manager-only.py
-
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.300"
+
+      - name: Apply live resilience changes
+        run: python scripts/run-live-resilience-manager-only.py
 
       - name: Install LLVM linker
         run: |
           sudo apt-get update
           sudo apt-get install -y lld
 
+      - name: Restore NuGet packages
+        run: dotnet restore src/N_m3u8DL-RE.Tests/N_m3u8DL-RE.Tests.csproj
+
       - name: Run tests
         run: dotnet test src/N_m3u8DL-RE.Tests/N_m3u8DL-RE.Tests.csproj -c Release --no-restore
 
       - name: Build Linux x64
         run: |
-          dotnet publish src/N_m3u8DL-RE -r linux-musl-x64 -c Release -o artifact -p:LinkerFlavor=lld
+          dotnet publish src/N_m3u8DL-RE -r linux-musl-x64 -c Release -o artifact -p:LinkerFlavor=lld --no-restore
 
       - name: Verify binary
         run: |
