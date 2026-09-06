@@ -1,0 +1,62 @@
+name: Build Diagnostic Linux x64 v4
+
+on:
+  push:
+    branches:
+      - fix/live-dash-period-handoff
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: 10.0.300
+  RID: linux-musl-x64
+
+jobs:
+  build-linux-x64-v4:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: fix/live-dash-period-handoff
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Apply live resilience v4
+        run: python scripts/run-live-resilience-v4.py
+
+      - name: Install LLVM linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld
+
+      - name: Restore NuGet packages
+        run: dotnet restore src/N_m3u8DL-RE.Tests/N_m3u8DL-RE.Tests.csproj -r ${{ env.RID }}
+
+      - name: Run tests
+        run: dotnet test src/N_m3u8DL-RE.Tests/N_m3u8DL-RE.Tests.csproj -c Release --no-restore
+
+      - name: Build Linux x64
+        run: dotnet publish src/N_m3u8DL-RE -r ${{ env.RID }} -c Release -o artifact -p:LinkerFlavor=lld --no-restore
+
+      - name: Verify binary
+        run: |
+          test -x artifact/N_m3u8DL-RE
+          file artifact/N_m3u8DL-RE
+          artifact/N_m3u8DL-RE --help >/tmp/help.txt
+          head -40 /tmp/help.txt
+
+      - name: Package
+        run: tar -czf N_m3u8DL-RE-diagnostic-v4-linux-x64.tar.gz -C artifact N_m3u8DL-RE
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: N_m3u8DL-RE-diagnostic-v4-linux-x64
+          path: N_m3u8DL-RE-diagnostic-v4-linux-x64.tar.gz
+          retention-days: 90
