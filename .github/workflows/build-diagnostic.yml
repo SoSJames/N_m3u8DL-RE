@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - fix/live-dash-period-handoff
   pull_request:
     branches:
       - main
