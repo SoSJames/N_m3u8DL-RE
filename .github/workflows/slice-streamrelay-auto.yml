@@ -1,0 +1,46 @@
+name: Slice StreamRelay Logs (Auto)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/live-dash-period-handoff
+    paths:
+      - '.github/workflows/slice-streamrelay-auto.yml'
+      - 'streamrelay-*-debug*.txt'
+      - 'scripts/slice-streamrelay-logs.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  slice:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/live-dash-period-handoff
+
+      - name: Slice all StreamRelay logs
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -File -Filter 'streamrelay-*-debug*.txt' | ForEach-Object { $_.FullName }
+          if ($files.Count -eq 0) {
+            throw 'No StreamRelay debug logs found.'
+          }
+          New-Item -ItemType Directory -Force -Path 'log-slices' | Out-Null
+          foreach ($file in $files) {
+            & ./scripts/slice-streamrelay-logs.ps1 -LogPath $file -ContextLines 50
+          }
+
+      - name: Package slices
+        shell: pwsh
+        run: Compress-Archive -Path 'log-slices/*' -DestinationPath 'streamrelay-log-slices.zip' -Force
+
+      - name: Upload slices
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamrelay-log-slices
+          path: streamrelay-log-slices.zip
+          retention-days: 14

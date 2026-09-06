@@ -1,0 +1,61 @@
+name: Slice StreamRelay Logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      log_files:
+        description: 'Comma-separated log filenames to slice (blank = all streamrelay-*-debug*.txt files)'
+        required: false
+        default: ''
+      context_lines:
+        description: 'Context lines before/after each significant event'
+        required: false
+        default: '20'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  slice:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@v4
+
+      - name: Slice logs
+        shell: pwsh
+        env:
+          LOG_FILES: ${{ inputs.log_files }}
+          CONTEXT_LINES: ${{ inputs.context_lines }}
+        run: |
+          $files = @()
+          if ([string]::IsNullOrWhiteSpace($env:LOG_FILES)) {
+            $files = Get-ChildItem -File -Filter 'streamrelay-*-debug*.txt' | ForEach-Object { $_.FullName }
+          } else {
+            $files = $env:LOG_FILES.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          }
+
+          if ($files.Count -eq 0) {
+            throw 'No StreamRelay debug logs found.'
+          }
+
+          New-Item -ItemType Directory -Force -Path 'log-slices' | Out-Null
+          foreach ($file in $files) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              Write-Warning "Skipping missing file: $file"
+              continue
+            }
+            & ./scripts/slice-streamrelay-logs.ps1 -LogPath $file -ContextLines ([int]$env:CONTEXT_LINES)
+          }
+
+      - name: Package slices
+        shell: pwsh
+        run: Compress-Archive -Path 'log-slices/*' -DestinationPath 'streamrelay-log-slices.zip' -Force
+
+      - name: Upload slices as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamrelay-log-slices
+          path: streamrelay-log-slices.zip
+          retention-days: 14
