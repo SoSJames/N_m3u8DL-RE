@@ -1,9 +1,6 @@
 name: Build Diagnostic Linux x64 v3
 
 on:
-  push:
-    branches:
-      - fix/live-dash-period-handoff
   workflow_dispatch:
 
 permissions:
