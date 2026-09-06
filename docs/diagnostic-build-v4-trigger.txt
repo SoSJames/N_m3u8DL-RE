@@ -1,0 +1,1 @@
+Trigger v4 diagnostic build with live DASH Period transition instrumentation and manifest-order handoff.
