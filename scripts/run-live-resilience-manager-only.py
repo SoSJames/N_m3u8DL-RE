@@ -37,6 +37,11 @@ new_live = '''                        if (isLive)
 if old_live in dash:
     dash = dash.replace(old_live, new_live, 1)
 
+# Overlapping live Period matches are not guaranteed to be returned in timeline
+# order. Do not use match.Last(), which can make the selected Period oscillate
+# between MPD refreshes and cause the recorder's init context to alternate.
+dash = dash.replace('                var matched = match.Last();', '                var matched = match.OrderByDescending(n => n.PeriodId, StringComparer.Ordinal).First();', 1)
+
 DASH.write_text(dash, encoding="utf-8")
 
 # Period identity and fMP4 initialization identity are deliberately separate.
@@ -110,4 +115,4 @@ if old_path in manager:
     manager = manager.replace(old_path, new_path, 1)
 
 MANAGER.write_text(manager, encoding="utf-8")
-print("Applied live DASH Period handoff plus init-context-aware recorder handling; Period-only changes now reuse the existing init, while init/KID changes get a unique context directory containing standard _init.mp4/_init_dec.mp4 filenames.")
+print("Applied live DASH Period handoff plus deterministic newest-Period selection and init-context-aware recorder handling; Period-only changes now reuse the existing init, while init/KID changes get a unique context directory containing standard _init.mp4/_init_dec.mp4 filenames.")
