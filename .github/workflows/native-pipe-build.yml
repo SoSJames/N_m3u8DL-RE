@@ -14,7 +14,30 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+
       - name: Build
         run: dotnet build src/N_m3u8DL-RE.sln -c Release
+
       - name: Test
         run: dotnet test src/N_m3u8DL-RE.sln -c Release --no-build
+
+      - name: Publish Linux x64 self-contained binary
+        run: |
+          dotnet publish src/N_m3u8DL-RE/N_m3u8DL-RE.csproj \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false \
+            -o artifacts/N_m3u8DL-RE-linux-x64
+          test -s artifacts/N_m3u8DL-RE-linux-x64/N_m3u8DL-RE
+          chmod +x artifacts/N_m3u8DL-RE-linux-x64/N_m3u8DL-RE
+          ./artifacts/N_m3u8DL-RE-linux-x64/N_m3u8DL-RE --help >/dev/null
+
+      - name: Upload Linux x64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: N_m3u8DL-RE-linux-x64-native-pipe
+          path: artifacts/N_m3u8DL-RE-linux-x64/N_m3u8DL-RE
+          if-no-files-found: error
+          retention-days: 30
