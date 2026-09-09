@@ -1,5 +1,6 @@
 ﻿using N_m3u8DL_RE.Common.Log;
 using Spectre.Console;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
@@ -11,6 +12,8 @@ namespace N_m3u8DL_RE.Util;
 internal static class PipeUtil
 {
     private const string StreamPipeOutputEnvironmentVariable = "N_M3U8_STREAM_PIPE_OUTPUT";
+    private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> NativePipeRegistries = new();
+    private static readonly ConcurrentDictionary<string, Task<bool>> NativeMuxTasks = new();
 
     [DllImport("libc", SetLastError = true)]
     private static extern int mkfifo(string pathname, uint mode);
@@ -54,6 +57,8 @@ internal static class PipeUtil
             // a FIFO with an ordinary file.
             var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
             Logger.InfoMarkUp($"[yellow]PIPE opened: {path.EscapeMarkup()}[/]");
+
+            RegisterNativePipeAndMaybeStartMux(pipeName);
             return stream;
         }
         catch (Exception ex)
@@ -63,24 +68,51 @@ internal static class PipeUtil
         }
     }
 
-    public static async Task<bool> StartPipeMuxAsync(string binary, string[] pipeNames, string outputPath)
+    private static void RegisterNativePipeAndMaybeStartMux(string pipeName)
     {
-        return await Task.Run(async () =>
-        {
-            Logger.InfoMarkUp($"[yellow]PIPE mux requested: streams={pipeNames.Length}; output={outputPath.EscapeMarkup()}[/]");
-            foreach (var pipe in pipeNames)
-                Logger.InfoMarkUp($"[yellow]PIPE mux input: {pipe.EscapeMarkup()}[/]");
+        var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(streamOutput))
+            return;
 
-            await Task.Delay(1000);
-            var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
-            if (!string.IsNullOrWhiteSpace(streamOutput))
+        var registry = NativePipeRegistries.GetOrAdd(streamOutput, _ => new ConcurrentDictionary<string, byte>());
+        registry.TryAdd(pipeName, 0);
+        Logger.InfoMarkUp($"[yellow]PIPE registration: {pipeName.EscapeMarkup()} ({registry.Count}/2)[/]");
+
+        // The native muxer is deliberately fixed to exactly two inputs: video + audio.
+        // Start it as soon as both pipes exist instead of depending on the selected-stream
+        // count, which may include an unpiped/extra track and otherwise leaves the muxer
+        // never started.
+        if (registry.Count != 2)
+            return;
+
+        var names = registry.Keys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        Logger.WarnMarkUp($"[deepskyblue1]PIPE registration complete: {names.Length}/2; starting native mux.[/]");
+        _ = StartPipeMuxAsync(string.Empty, names, streamOutput);
+    }
+
+    public static Task<bool> StartPipeMuxAsync(string binary, string[] pipeNames, string outputPath)
+    {
+        Logger.InfoMarkUp($"[yellow]PIPE mux requested: streams={pipeNames.Length}; output={outputPath.EscapeMarkup()}[/]");
+        foreach (var pipe in pipeNames)
+            Logger.InfoMarkUp($"[yellow]PIPE mux input: {pipe.EscapeMarkup()}[/]");
+
+        var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
+        if (!string.IsNullOrWhiteSpace(streamOutput))
+        {
+            return NativeMuxTasks.GetOrAdd(streamOutput, _ => Task.Run(async () =>
             {
                 Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
-                Logger.InfoMarkUp("[deepskyblue1]Starting native fMP4 -> MPEG-TS muxer.[/]");
+                Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
+                Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
                 var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput);
                 Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
+                NativePipeRegistries.TryRemove(streamOutput, out _);
                 return result;
-            }
+            }));
+        }
+
+        return Task.Run(() =>
+        {
             Logger.InfoMarkUp("[yellow]N_M3U8_STREAM_PIPE_OUTPUT is not set; using legacy FFmpeg pipe mux.[/]");
             return StartPipeMux(binary, pipeNames, outputPath);
         });
