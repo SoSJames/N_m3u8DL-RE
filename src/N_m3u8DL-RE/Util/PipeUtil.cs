@@ -61,11 +61,12 @@ internal static class PipeUtil
 
             RegisterNativePipeAndMaybeStartMux(pipeName);
 
-            // In native live-pipe mode the first stream must not start CopyTo() until
-            // the second A/V FIFO has been created and the native mux task is running.
-            // Otherwise the first FIFO fills, its synchronous CopyTo blocks, and the
-            // second stream never gets a chance to create its FIFO (startup deadlock).
-            WaitForNativeMuxReady();
+            // Do not synchronously wait here. CreatePipe is called from the parallel
+            // stream workers; blocking the first worker here can starve the worker that
+            // needs to create the second A/V FIFO. The returned stream gates its first
+            // write on native mux readiness instead, allowing both FIFOs to be created.
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable)))
+                return new NativeMuxReadyStream(stream);
 
             return stream;
         }
@@ -76,27 +77,80 @@ internal static class PipeUtil
         }
     }
 
-    private static void WaitForNativeMuxReady()
+    private static bool WaitForNativeMuxReady()
     {
         var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
         if (string.IsNullOrWhiteSpace(streamOutput))
-            return;
+            return true;
 
         var ready = NativeMuxReady.GetOrAdd(streamOutput, _ =>
             new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
 
         if (ready.Task.IsCompletedSuccessfully)
-        {
-            Logger.InfoMarkUp("[deepskyblue1]PIPE native mux readiness already signaled.[/]");
-            return;
-        }
+            return true;
 
-        Logger.InfoMarkUp("[yellow]PIPE waiting for native mux readiness before returning pipe.[/]");
+        Logger.InfoMarkUp("[yellow]PIPE waiting for native mux readiness before first media write.[/]");
         var ok = ready.Task.GetAwaiter().GetResult();
         if (!ok)
             throw new IOException("Native MPEG-TS mux failed to start.");
 
         Logger.InfoMarkUp("[green]PIPE native mux ready; media copy may begin.[/]");
+        return true;
+    }
+
+    private sealed class NativeMuxReadyStream : Stream
+    {
+        private readonly Stream inner;
+        private bool ready;
+
+        public NativeMuxReadyStream(Stream inner) => this.inner = inner;
+
+        private void EnsureReady()
+        {
+            if (ready) return;
+            WaitForNativeMuxReady();
+            ready = true;
+        }
+
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => inner.CanSeek;
+        public override bool CanWrite => inner.CanWrite;
+        public override long Length => inner.Length;
+        public override long Position { get => inner.Position; set => inner.Position = value; }
+        public override void Flush() => inner.Flush();
+        public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
+        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+        public override int Read(Span<byte> buffer) => inner.Read(buffer);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => inner.ReadAsync(buffer, cancellationToken);
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => inner.ReadAsync(buffer, offset, count, cancellationToken);
+        public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+        public override void SetLength(long value) => inner.SetLength(value);
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            EnsureReady();
+            inner.Write(buffer, offset, count);
+        }
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            EnsureReady();
+            inner.Write(buffer);
+        }
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            EnsureReady();
+            return inner.WriteAsync(buffer, offset, count, cancellationToken);
+        }
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            EnsureReady();
+            return inner.WriteAsync(buffer, cancellationToken);
+        }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) inner.Dispose();
+            base.Dispose(disposing);
+        }
+        public override ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 
     private static void RegisterNativePipeAndMaybeStartMux(string pipeName)
@@ -144,8 +198,7 @@ internal static class PipeUtil
                     // Signal readiness as soon as the native mux worker has started.
                     // The input FIFOs are already open read/write on the producer side,
                     // so the mux can immediately attach to them without another blocking
-                    // named-pipe handshake. This is intentionally before RunAsync so the
-                    // producer cannot deadlock waiting for a task that is waiting on data.
+                    // named-pipe handshake.
                     ready.TrySetResult(true);
 
                     var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput);
