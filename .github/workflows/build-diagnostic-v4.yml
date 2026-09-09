@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - experiment/shaka-live-packager
+      - experiment/shaka-embedded-live
   workflow_dispatch:
 
 permissions:
@@ -11,8 +12,9 @@ permissions:
 
 env:
   DOTNET_VERSION: 10.0.300
+  SHAKA_VERSION: v3.7.2
 
-jobs:
+enjobs:
   build-linux-x64-v4:
     runs-on: ubuntu-latest
     env:
@@ -21,12 +23,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: experiment/shaka-live-packager
+          ref: ${{ github.ref_name }}
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Download embedded Shaka Packager
+        run: |
+          mkdir -p src/N_m3u8DL-RE/Assets/Shaka/linux-x64
+          curl -L --fail --retry 3 \
+            -o src/N_m3u8DL-RE/Assets/Shaka/linux-x64/packager \
+            "https://github.com/shaka-project/shaka-packager/releases/download/${SHAKA_VERSION}/packager-linux-x64"
+          echo "88b022b8cb12602ddb539972efd07a3496ea64f8662a484798c96e95afa41fd8  src/N_m3u8DL-RE/Assets/Shaka/linux-x64/packager" | sha256sum -c -
+          chmod +x src/N_m3u8DL-RE/Assets/Shaka/linux-x64/packager
 
       - name: Apply live resilience v4
         run: |
@@ -73,12 +84,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: experiment/shaka-live-packager
+          ref: ${{ github.ref_name }}
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Download embedded Shaka Packager
+        shell: pwsh
+        run: |
+          $dir = "src/N_m3u8DL-RE/Assets/Shaka/win-x64"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $url = "https://github.com/shaka-project/shaka-packager/releases/download/$env:SHAKA_VERSION/packager-win-x64.exe"
+          $out = "$dir/packager.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne "61e26b68884c81d107ebd5b7ba6499bfa5a589b90245dac9683c5d50f999574a") {
+            throw "Shaka Packager SHA-256 mismatch: $hash"
+          }
 
       - name: Apply live resilience v4
         shell: pwsh
