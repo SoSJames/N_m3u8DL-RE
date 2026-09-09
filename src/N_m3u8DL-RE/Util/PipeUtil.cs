@@ -94,7 +94,9 @@ internal static class PipeUtil
         args.Append(" --default_language en");
         args.Append(" --io_block_size 65536");
 
-        Logger.WarnMarkUp($"[deepskyblue1]Experimental Shaka live mode[/]");
+        Logger.WarnMarkUp("[deepskyblue1][SHAKA-TEST] StartShakaLiveAsync reached[/]");
+        Logger.InfoMarkUp($"[deepskyblue1][SHAKA-TEST] Packager: {binary.EscapeMarkup()}[/]");
+        Logger.InfoMarkUp($"[deepskyblue1][SHAKA-TEST] Pipes: {string.Join(", ", pipeNames).EscapeMarkup()}[/]");
         Logger.InfoMarkUp($"HLS output: [cyan]{master.EscapeMarkup()}[/]");
         Logger.DebugMarkUp($"[grey]{binary.EscapeMarkup()} {args.ToString().EscapeMarkup()}[/]");
 
@@ -142,10 +144,13 @@ internal static class PipeUtil
 
     public static bool StartPipeMux(string binary, string[] pipeNames, string outputPath)
     {
+        // Diagnostic marker: this is the established synchronous live-pipe entry point.
+        var shakaBinary = Environment.GetEnvironmentVariable("N_M3U8DL_RE_LIVE_SHAKA_PACKAGER");
+        Logger.WarnMarkUp($"[deepskyblue1][SHAKA-TEST] StartPipeMux reached; env={(string.IsNullOrWhiteSpace(shakaBinary) ? "<empty>" : shakaBinary.EscapeMarkup())}[/]");
+
         // The live recorder's established pipe path calls this synchronous
         // entry point. Route it through the experimental Shaka publisher when
         // explicitly enabled, otherwise retain the original FFmpeg behavior.
-        var shakaBinary = Environment.GetEnvironmentVariable("N_M3U8DL_RE_LIVE_SHAKA_PACKAGER");
         if (!string.IsNullOrWhiteSpace(shakaBinary))
             return StartShakaLiveAsync(shakaBinary, pipeNames, outputPath).GetAwaiter().GetResult();
 
