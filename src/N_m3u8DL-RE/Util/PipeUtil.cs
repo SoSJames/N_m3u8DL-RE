@@ -35,13 +35,17 @@ internal static class PipeUtil
 
     public static async Task<bool> StartPipeMuxAsync(string binary, string[] pipeNames, string outputPath)
     {
+        // Diagnostic marker at the actual asynchronous entry point used by
+        // SimpleLiveRecordManager2. This is intentionally before the delay and
+        // before the environment-variable decision.
+        Logger.WarnMarkUp("[deepskyblue1][SHAKA-TEST] StartPipeMuxAsync reached[/]");
+
         return await Task.Run(async () =>
         {
             await Task.Delay(1000);
 
-            // Experimental live Shaka mode. The normal FFmpeg pipe path remains
-            // unchanged unless this environment variable is explicitly set.
             var shakaBinary = Environment.GetEnvironmentVariable("N_M3U8DL_RE_LIVE_SHAKA_PACKAGER");
+            Logger.WarnMarkUp($"[deepskyblue1][SHAKA-TEST] Async env={(string.IsNullOrWhiteSpace(shakaBinary) ? "<empty>" : shakaBinary.EscapeMarkup())}[/]");
             if (!string.IsNullOrWhiteSpace(shakaBinary))
                 return await StartShakaLiveAsync(shakaBinary, pipeNames, outputPath);
 
@@ -144,13 +148,10 @@ internal static class PipeUtil
 
     public static bool StartPipeMux(string binary, string[] pipeNames, string outputPath)
     {
-        // Diagnostic marker: this is the established synchronous live-pipe entry point.
+        // Diagnostic marker retained for the synchronous entry point.
         var shakaBinary = Environment.GetEnvironmentVariable("N_M3U8DL_RE_LIVE_SHAKA_PACKAGER");
         Logger.WarnMarkUp($"[deepskyblue1][SHAKA-TEST] StartPipeMux reached; env={(string.IsNullOrWhiteSpace(shakaBinary) ? "<empty>" : shakaBinary.EscapeMarkup())}[/]");
 
-        // The live recorder's established pipe path calls this synchronous
-        // entry point. Route it through the experimental Shaka publisher when
-        // explicitly enabled, otherwise retain the original FFmpeg behavior.
         if (!string.IsNullOrWhiteSpace(shakaBinary))
             return StartShakaLiveAsync(shakaBinary, pipeNames, outputPath).GetAwaiter().GetResult();
 
