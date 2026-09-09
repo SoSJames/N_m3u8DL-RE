@@ -14,7 +14,7 @@ env:
   DOTNET_VERSION: 10.0.300
   SHAKA_VERSION: v3.7.2
 
-enjobs:
+jobs:
   build-linux-x64-v4:
     runs-on: ubuntu-latest
     env:
