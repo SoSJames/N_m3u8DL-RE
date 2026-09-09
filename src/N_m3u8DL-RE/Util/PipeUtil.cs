@@ -14,6 +14,7 @@ internal static class PipeUtil
     private const string StreamPipeOutputEnvironmentVariable = "N_M3U8_STREAM_PIPE_OUTPUT";
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> NativePipeRegistries = new();
     private static readonly ConcurrentDictionary<string, Task<bool>> NativeMuxTasks = new();
+    private static readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> NativeMuxReady = new();
 
     [DllImport("libc", SetLastError = true)]
     private static extern int mkfifo(string pathname, uint mode);
@@ -59,6 +60,13 @@ internal static class PipeUtil
             Logger.InfoMarkUp($"[yellow]PIPE opened: {path.EscapeMarkup()}[/]");
 
             RegisterNativePipeAndMaybeStartMux(pipeName);
+
+            // In native live-pipe mode the first stream must not start CopyTo() until
+            // the second A/V FIFO has been created and the native mux task is running.
+            // Otherwise the first FIFO fills, its synchronous CopyTo blocks, and the
+            // second stream never gets a chance to create its FIFO (startup deadlock).
+            WaitForNativeMuxReady();
+
             return stream;
         }
         catch (Exception ex)
@@ -66,6 +74,29 @@ internal static class PipeUtil
             Logger.ErrorMarkUp($"[PIPE-TRACE] CreatePipe FAILED path={path.EscapeMarkup()} type={ex.GetType().Name} message={ex.Message.EscapeMarkup()}");
             throw;
         }
+    }
+
+    private static void WaitForNativeMuxReady()
+    {
+        var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(streamOutput))
+            return;
+
+        var ready = NativeMuxReady.GetOrAdd(streamOutput, _ =>
+            new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
+
+        if (ready.Task.IsCompletedSuccessfully)
+        {
+            Logger.InfoMarkUp("[deepskyblue1]PIPE native mux readiness already signaled.[/]");
+            return;
+        }
+
+        Logger.InfoMarkUp("[yellow]PIPE waiting for native mux readiness before returning pipe.[/]");
+        var ok = ready.Task.GetAwaiter().GetResult();
+        if (!ok)
+            throw new IOException("Native MPEG-TS mux failed to start.");
+
+        Logger.InfoMarkUp("[green]PIPE native mux ready; media copy may begin.[/]");
     }
 
     private static void RegisterNativePipeAndMaybeStartMux(string pipeName)
@@ -99,15 +130,38 @@ internal static class PipeUtil
         var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(streamOutput))
         {
+            var ready = NativeMuxReady.GetOrAdd(streamOutput, _ =>
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
+
             return NativeMuxTasks.GetOrAdd(streamOutput, key => Task.Run(async () =>
             {
-                Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
-                Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
-                Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
-                var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput);
-                Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
-                NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
-                return result;
+                try
+                {
+                    Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
+                    Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
+                    Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
+
+                    // Signal readiness as soon as the native mux worker has started.
+                    // The input FIFOs are already open read/write on the producer side,
+                    // so the mux can immediately attach to them without another blocking
+                    // named-pipe handshake. This is intentionally before RunAsync so the
+                    // producer cannot deadlock waiting for a task that is waiting on data.
+                    ready.TrySetResult(true);
+
+                    var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput);
+                    Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
+                    return result;
+                }
+                catch (Exception ex)
+                {
+                    ready.TrySetResult(false);
+                    Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
+                    return false;
+                }
+                finally
+                {
+                    NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
+                }
             }));
         }
 
