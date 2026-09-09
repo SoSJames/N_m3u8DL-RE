@@ -1,4 +1,4 @@
-﻿using N_m3u8DL_RE.Common.Log;
+using N_m3u8DL_RE.Common.Log;
 using Spectre.Console;
 using System.Diagnostics;
 using System.IO.Pipes;
@@ -142,6 +142,13 @@ internal static class PipeUtil
 
     public static bool StartPipeMux(string binary, string[] pipeNames, string outputPath)
     {
+        // The live recorder's established pipe path calls this synchronous
+        // entry point. Route it through the experimental Shaka publisher when
+        // explicitly enabled, otherwise retain the original FFmpeg behavior.
+        var shakaBinary = Environment.GetEnvironmentVariable("N_M3U8DL_RE_LIVE_SHAKA_PACKAGER");
+        if (!string.IsNullOrWhiteSpace(shakaBinary))
+            return StartShakaLiveAsync(shakaBinary, pipeNames, outputPath).GetAwaiter().GetResult();
+
         var dateString = DateTime.Now.ToString("o");
         var command = new StringBuilder("-y -fflags +genpts -loglevel quiet ");
 
