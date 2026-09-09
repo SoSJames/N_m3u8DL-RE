@@ -2,6 +2,7 @@ using N_m3u8DL_RE.Common.Log;
 using Spectre.Console;
 using System.Diagnostics;
 using System.IO.Pipes;
+using System.Reflection;
 using System.Text;
 using N_m3u8DL_RE.Config;
 
@@ -35,108 +36,173 @@ internal static class PipeUtil
 
     public static async Task<bool> StartPipeMuxAsync(string binary, string[] pipeNames, string outputPath)
     {
-        // Diagnostic marker at the actual asynchronous entry point used by
-        // SimpleLiveRecordManager2. This is intentionally before the delay and
-        // before the environment-variable decision.
-        Logger.WarnMarkUp("[deepskyblue1][SHAKA-TEST] StartPipeMuxAsync reached[/]");
-
-        return await Task.Run(async () =>
-        {
-            await Task.Delay(1000);
-
-            var shakaBinary = Environment.GetEnvironmentVariable("N_M3U8DL_RE_LIVE_SHAKA_PACKAGER");
-            Logger.WarnMarkUp($"[deepskyblue1][SHAKA-TEST] Async env={(string.IsNullOrWhiteSpace(shakaBinary) ? "<empty>" : shakaBinary.EscapeMarkup())}[/]");
-            if (!string.IsNullOrWhiteSpace(shakaBinary))
-                return await StartShakaLiveAsync(shakaBinary, pipeNames, outputPath);
-
-            return StartPipeMux(binary, pipeNames, outputPath);
-        });
+        // SimpleLiveRecordManager2 calls this method for the established live-pipe path.
+        // This experimental branch intentionally replaces the FFmpeg process with the
+        // embedded Shaka Packager process. There is no PATH lookup, environment-variable
+        // lookup, or externally supplied Shaka executable.
+        Logger.WarnMarkUp("[deepskyblue1][SHAKA-EMBEDDED] StartPipeMuxAsync reached[/]");
+        return await StartEmbeddedShakaLiveAsync(pipeNames, outputPath);
     }
 
-    private static async Task<bool> StartShakaLiveAsync(string binary, string[] pipeNames, string outputPath)
+    private static async Task<bool> StartEmbeddedShakaLiveAsync(string[] pipeNames, string outputPath)
     {
         if (pipeNames.Length == 0 || pipeNames.Length > 2)
         {
-            Logger.ErrorMarkUp("Experimental Shaka live mode supports one video pipe or one video + one audio pipe.");
+            Logger.ErrorMarkUp("[SHAKA-EMBEDDED] Supports one video pipe or one video + one audio pipe.");
             return false;
         }
 
-        var outputDir = Path.Combine(
-            Path.GetDirectoryName(outputPath) ?? Environment.CurrentDirectory,
-            Path.GetFileNameWithoutExtension(outputPath) + ".hls");
-        Directory.CreateDirectory(outputDir);
-        var videoDir = Path.Combine(outputDir, "video");
-        Directory.CreateDirectory(videoDir);
-
-        var audioDir = Path.Combine(outputDir, "audio");
-        if (pipeNames.Length == 2)
-            Directory.CreateDirectory(audioDir);
-
-        var descriptors = new List<string>();
-        var videoPipe = GetPipePath(pipeNames[0]);
-        descriptors.Add(
-            $"in=\"{videoPipe}\",stream=video,init_segment=\"{Path.Combine(videoDir, "init.mp4")}\",segment_template=\"{Path.Combine(videoDir, "$Number$.m4s")}\",playlist_name=\"video.m3u8\"");
-
-        if (pipeNames.Length == 2)
+        string? shakaBinary = null;
+        try
         {
-            var audioPipe = GetPipePath(pipeNames[1]);
-            descriptors.Add(
-                $"in=\"{audioPipe}\",stream=audio,language=en,hls_name=English,init_segment=\"{Path.Combine(audioDir, "init.mp4")}\",segment_template=\"{Path.Combine(audioDir, "$Number$.m4s")}\",playlist_name=\"audio.m3u8\",hls_group_id=audio");
+            shakaBinary = ExtractEmbeddedShakaPackager();
+
+            var outputDir = Path.Combine(
+                Path.GetDirectoryName(outputPath) ?? Environment.CurrentDirectory,
+                Path.GetFileNameWithoutExtension(outputPath) + ".hls");
+            Directory.CreateDirectory(outputDir);
+
+            var videoDir = Path.Combine(outputDir, "video");
+            Directory.CreateDirectory(videoDir);
+
+            var audioDir = Path.Combine(outputDir, "audio");
+            if (pipeNames.Length == 2)
+                Directory.CreateDirectory(audioDir);
+
+            var videoPipe = GetPipePath(pipeNames[0]);
+            var videoDescriptor =
+                $"in=\"{videoPipe}\",stream=video,init_segment=\"{Path.Combine(videoDir, "init.mp4")}\"," +
+                $"segment_template=\"{Path.Combine(videoDir, "$Number$.m4s")}\",playlist_name=\"video.m3u8\"";
+
+            var master = Path.Combine(outputDir, "master.m3u8");
+
+            using var process = new Process();
+            process.StartInfo = new ProcessStartInfo
+            {
+                WorkingDirectory = Environment.CurrentDirectory,
+                FileName = shakaBinary,
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+
+            // ArgumentList deliberately avoids manual command-line quoting.
+            process.StartInfo.ArgumentList.Add(videoDescriptor);
+
+            if (pipeNames.Length == 2)
+            {
+                var audioPipe = GetPipePath(pipeNames[1]);
+                var audioDescriptor =
+                    $"in=\"{audioPipe}\",stream=audio,language=en,hls_name=English," +
+                    $"init_segment=\"{Path.Combine(audioDir, "init.mp4")}\"," +
+                    $"segment_template=\"{Path.Combine(audioDir, "$Number$.m4s")}\"," +
+                    $"playlist_name=\"audio.m3u8\",hls_group_id=audio";
+                process.StartInfo.ArgumentList.Add(audioDescriptor);
+            }
+
+            process.StartInfo.ArgumentList.Add("--hls_master_playlist_output");
+            process.StartInfo.ArgumentList.Add(master);
+            process.StartInfo.ArgumentList.Add("--hls_playlist_type");
+            process.StartInfo.ArgumentList.Add("LIVE");
+            process.StartInfo.ArgumentList.Add("--segment_duration");
+            process.StartInfo.ArgumentList.Add("2.002");
+            process.StartInfo.ArgumentList.Add("--fragment_duration");
+            process.StartInfo.ArgumentList.Add("2.002");
+            process.StartInfo.ArgumentList.Add("--time_shift_buffer_depth");
+            process.StartInfo.ArgumentList.Add("24");
+            process.StartInfo.ArgumentList.Add("--preserved_segments_outside_live_window");
+            process.StartInfo.ArgumentList.Add("24");
+            process.StartInfo.ArgumentList.Add("--suggested_presentation_delay");
+            process.StartInfo.ArgumentList.Add("8");
+            process.StartInfo.ArgumentList.Add("--default_language");
+            process.StartInfo.ArgumentList.Add("en");
+            process.StartInfo.ArgumentList.Add("--io_block_size");
+            process.StartInfo.ArgumentList.Add("65536");
+
+            Logger.WarnMarkUp("[deepskyblue1][SHAKA-EMBEDDED] Launching embedded Shaka Packager[/]");
+            Logger.InfoMarkUp($"[deepskyblue1][SHAKA-EMBEDDED] Binary: {shakaBinary.EscapeMarkup()}[/]");
+            Logger.InfoMarkUp($"[deepskyblue1][SHAKA-EMBEDDED] Pipes: {string.Join(", ", pipeNames).EscapeMarkup()}[/]");
+            Logger.InfoMarkUp($"HLS output: [cyan]{master.EscapeMarkup()}[/]");
+
+            process.Start();
+
+            _ = Task.Run(async () =>
+            {
+                while (await process.StandardError.ReadLineAsync() is { } line)
+                {
+                    if (!string.IsNullOrWhiteSpace(line))
+                        Logger.DebugMarkUp($"[grey][Shaka] {line.EscapeMarkup()}[/]");
+                }
+            });
+
+            _ = Task.Run(async () =>
+            {
+                while (await process.StandardOutput.ReadLineAsync() is { } line)
+                {
+                    if (!string.IsNullOrWhiteSpace(line))
+                        Logger.DebugMarkUp($"[grey][Shaka] {line.EscapeMarkup()}[/]");
+                }
+            });
+
+            await process.WaitForExitAsync();
+            Logger.WarnMarkUp($"[SHAKA-EMBEDDED] Shaka Packager exited with code {process.ExitCode}");
+            return process.ExitCode == 0;
+        }
+        catch (Exception ex)
+        {
+            Logger.ErrorMarkUp($"[SHAKA-EMBEDDED] Failed to launch embedded Shaka Packager: {ex.Message.EscapeMarkup()}");
+            return false;
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(shakaBinary))
+            {
+                try
+                {
+                    File.Delete(shakaBinary);
+                }
+                catch
+                {
+                    // Best effort cleanup only.
+                }
+            }
+        }
+    }
+
+    private static string ExtractEmbeddedShakaPackager()
+    {
+        var rid = OperatingSystem.IsWindows() ? "win-x64" : "linux-x64";
+        var extension = OperatingSystem.IsWindows() ? ".exe" : string.Empty;
+        var suffix = $".Assets.Shaka.{rid}.packager{extension}";
+
+        var resourceName = Assembly.GetExecutingAssembly()
+            .GetManifestResourceNames()
+            .SingleOrDefault(x => x.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+
+        if (resourceName is null)
+            throw new FileNotFoundException($"Embedded Shaka Packager resource not found for {rid}.");
+
+        var root = Path.Combine(Path.GetTempPath(), "N_m3u8DL-RE", "shaka");
+        Directory.CreateDirectory(root);
+
+        var path = Path.Combine(root, $"{rid}-{Guid.NewGuid():N}{extension}");
+        using var input = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException($"Unable to open embedded Shaka resource '{resourceName}'.");
+
+        using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        input.CopyTo(output);
+        output.Flush();
+
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
-        var master = Path.Combine(outputDir, "master.m3u8");
-        var args = new StringBuilder();
-        foreach (var descriptor in descriptors)
-            args.Append($" \"{descriptor}\"");
-        args.Append($" --hls_master_playlist_output \"{master}\"");
-        args.Append(" --hls_playlist_type LIVE");
-        args.Append(" --segment_duration 2.002");
-        args.Append(" --fragment_duration 2.002");
-        args.Append(" --time_shift_buffer_depth 24");
-        args.Append(" --preserved_segments_outside_live_window 24");
-        args.Append(" --suggested_presentation_delay 8");
-        args.Append(" --default_language en");
-        args.Append(" --io_block_size 65536");
-
-        Logger.WarnMarkUp("[deepskyblue1][SHAKA-TEST] StartShakaLiveAsync reached[/]");
-        Logger.InfoMarkUp($"[deepskyblue1][SHAKA-TEST] Packager: {binary.EscapeMarkup()}[/]");
-        Logger.InfoMarkUp($"[deepskyblue1][SHAKA-TEST] Pipes: {string.Join(", ", pipeNames).EscapeMarkup()}[/]");
-        Logger.InfoMarkUp($"HLS output: [cyan]{master.EscapeMarkup()}[/]");
-        Logger.DebugMarkUp($"[grey]{binary.EscapeMarkup()} {args.ToString().EscapeMarkup()}[/]");
-
-        using var process = new Process();
-        process.StartInfo = new ProcessStartInfo()
-        {
-            WorkingDirectory = Environment.CurrentDirectory,
-            FileName = binary,
-            Arguments = args.ToString(),
-            CreateNoWindow = true,
-            UseShellExecute = false,
-            RedirectStandardError = true,
-            RedirectStandardOutput = true
-        };
-
-        process.Start();
-        _ = Task.Run(async () =>
-        {
-            while (await process.StandardError.ReadLineAsync() is { } line)
-            {
-                if (!string.IsNullOrWhiteSpace(line))
-                    Logger.DebugMarkUp($"[grey][Shaka] {line.EscapeMarkup()}[/]");
-            }
-        });
-        _ = Task.Run(async () =>
-        {
-            while (await process.StandardOutput.ReadLineAsync() is { } line)
-            {
-                if (!string.IsNullOrWhiteSpace(line))
-                    Logger.DebugMarkUp($"[grey][Shaka] {line.EscapeMarkup()}[/]");
-            }
-        });
-
-        await process.WaitForExitAsync();
-        Logger.WarnMarkUp($"Shaka Packager exited with code {process.ExitCode}");
-        return process.ExitCode == 0;
+        Logger.InfoMarkUp($"[SHAKA-EMBEDDED] Extracted resource: {resourceName.EscapeMarkup()}");
+        return path;
     }
 
     private static string GetPipePath(string pipeName)
@@ -148,13 +214,6 @@ internal static class PipeUtil
 
     public static bool StartPipeMux(string binary, string[] pipeNames, string outputPath)
     {
-        // Diagnostic marker retained for the synchronous entry point.
-        var shakaBinary = Environment.GetEnvironmentVariable("N_M3U8DL_RE_LIVE_SHAKA_PACKAGER");
-        Logger.WarnMarkUp($"[deepskyblue1][SHAKA-TEST] StartPipeMux reached; env={(string.IsNullOrWhiteSpace(shakaBinary) ? "<empty>" : shakaBinary.EscapeMarkup())}[/]");
-
-        if (!string.IsNullOrWhiteSpace(shakaBinary))
-            return StartShakaLiveAsync(shakaBinary, pipeNames, outputPath).GetAwaiter().GetResult();
-
         var dateString = DateTime.Now.ToString("o");
         var command = new StringBuilder("-y -fflags +genpts -loglevel quiet ");
 
