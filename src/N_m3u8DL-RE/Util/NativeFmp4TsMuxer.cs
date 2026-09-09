@@ -14,11 +14,13 @@ internal sealed class NativeFmp4TsMuxer
     private int videoCc, audioCc, pmtCc;
     private Track? video, audio;
     private bool psiWritten;
+    private long videoSamples, audioSamples, videoBytes, audioBytes, moofCount;
 
     private NativeFmp4TsMuxer(Stream output) => this.output = output;
 
     public static async Task<bool> RunAsync(string[] pipeNames, string outputPath)
     {
+        Logger.InfoMarkUp($"[yellow]Native mux entry: inputs={pipeNames.Length}; output={outputPath.EscapeMarkup()}[/]");
         if (pipeNames.Length != 2)
         {
             Logger.ErrorMarkUp("[red]Native mux requires exactly two non-subtitle streams (video + audio).[/]");
@@ -26,20 +28,25 @@ internal sealed class NativeFmp4TsMuxer
         }
         try
         {
+            Logger.InfoMarkUp($"[yellow]Native mux opening input pipe 0: {pipeNames[0].EscapeMarkup()}[/]");
             await using var p0 = OpenPipe(pipeNames[0]);
+            Logger.InfoMarkUp("[green]Native mux input pipe 0 opened.[/]");
+            Logger.InfoMarkUp($"[yellow]Native mux opening input pipe 1: {pipeNames[1].EscapeMarkup()}[/]");
             await using var p1 = OpenPipe(pipeNames[1]);
-            // StreamRelay supplies a FIFO here. FileMode.Open is intentional: this class
-            // never creates or truncates a regular recording file.
+            Logger.InfoMarkUp("[green]Native mux input pipe 1 opened.[/]");
+            Logger.InfoMarkUp($"[yellow]Native mux opening output FIFO: {outputPath.EscapeMarkup()}[/]");
             await using var dst = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
                 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            Logger.InfoMarkUp("[green]Native mux output FIFO opened.[/]");
             var mux = new NativeFmp4TsMuxer(dst);
             await Task.WhenAll(mux.ReadPipeAsync(p0, 0), mux.ReadPipeAsync(p1, 1));
             await dst.FlushAsync();
+            Logger.InfoMarkUp($"[deepskyblue1]Native mux complete: moof={mux.moofCount}; videoSamples={mux.videoSamples}; audioSamples={mux.audioSamples}; videoBytes={mux.videoBytes}; audioBytes={mux.audioBytes}; psi={mux.psiWritten}[/]");
             return mux.psiWritten;
         }
         catch (Exception ex)
         {
-            Logger.ErrorMarkUp($"[red]Native fMP4 mux failed: {ex.Message.EscapeMarkup()}[/]");
+            Logger.ErrorMarkUp($"[red]Native fMP4 mux failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
             return false;
         }
     }
@@ -50,23 +57,40 @@ internal sealed class NativeFmp4TsMuxer
 
     private async Task ReadPipeAsync(Stream pipe, int pipeIndex)
     {
+        Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex} started.[/]");
         var r = new BoxReader(pipe);
         Track? track = null;
         while (true)
         {
             var box = await r.ReadAsync();
-            if (box == null) break;
+            if (box == null)
+            {
+                Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: input EOF.[/]");
+                break;
+            }
             if (box.Value.Type == "moov")
             {
                 track = ParseInit(box.Value.Payload);
-                if (track.Kind == Kind.Video) video = track; else audio = track;
+                if (track.Kind == Kind.Video)
+                {
+                    video = track;
+                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: video init codec={track.Codec}; timescale={track.TimeScale}; nalLength={track.NalLengthSize}.[/]");
+                }
+                else
+                {
+                    audio = track;
+                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: audio init timescale={track.TimeScale}; AAC profile={track.AacProfile}; freqIndex={track.AacFreq}; channels={track.Channels}.[/]");
+                }
                 continue;
             }
             if (box.Value.Type != "moof") continue;
+            moofCount++;
             var mdat = await r.ReadAsync();
             if (mdat == null || mdat.Value.Type != "mdat") throw new InvalidDataException("moof is not followed by mdat");
             if (track == null) continue;
-            foreach (var sample in ParseFragment(box.Value.Payload, mdat.Value.Payload, track))
+            var samples = ParseFragment(box.Value.Payload, mdat.Value.Payload, track);
+            Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: moof #{moofCount} track={track.Kind} mdat={mdat.Value.Payload.Length} samples={samples.Count}.[/]");
+            foreach (var sample in samples)
                 await EmitAsync(track, sample);
         }
     }
@@ -76,11 +100,28 @@ internal sealed class NativeFmp4TsMuxer
         while (video == null || audio == null) await Task.Delay(5);
         lock (gate)
         {
-            if (!psiWritten) { WritePsi(); psiWritten = true; }
+            if (!psiWritten)
+            {
+                WritePsi();
+                psiWritten = true;
+                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/]");
+            }
             var pts = Scale90((long)s.Dts + s.Cto, t.TimeScale);
             var dts = Scale90((long)s.Dts, t.TimeScale);
-            if (t.Kind == Kind.Video) WritePes(ConvertVideo(s.Data, t), VideoPid, pts, dts, true, ref videoCc);
-            else WritePes(AddAdts(s.Data, t), AudioPid, pts, pts, false, ref audioCc);
+            if (t.Kind == Kind.Video)
+            {
+                var payload = ConvertVideo(s.Data, t);
+                videoSamples++;
+                videoBytes += payload.Length;
+                WritePes(payload, VideoPid, pts, dts, true, ref videoCc);
+            }
+            else
+            {
+                var payload = AddAdts(s.Data, t);
+                audioSamples++;
+                audioBytes += payload.Length;
+                WritePes(payload, AudioPid, pts, pts, false, ref audioCc);
+            }
         }
         await Task.CompletedTask;
     }
@@ -99,7 +140,7 @@ internal sealed class NativeFmp4TsMuxer
             if (mdhd != null)
             {
                 var p = mdhd.Value.Payload;
-                if (p.Length >= 20 && p[0] == 1) t.TimeScale = BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(20, 4));
+                if (p.Length >= 24 && p[0] == 1) t.TimeScale = BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(20, 4));
                 else if (p.Length >= 16) t.TimeScale = BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(12, 4));
             }
             if (t.TimeScale == 0) t.TimeScale = t.Kind == Kind.Audio ? 48000u : 90000u;
@@ -138,19 +179,35 @@ internal sealed class NativeFmp4TsMuxer
             var trun = FindBox(traf.Payload, "trun");
             if (trun == null) continue;
             ulong dts = 0;
-            if (tfdt != null) dts = tfdt.Value.Payload[0] == 1 ? BinaryPrimitives.ReadUInt64BigEndian(tfdt.Value.Payload.AsSpan(4, 8)) : BinaryPrimitives.ReadUInt32BigEndian(tfdt.Value.Payload.AsSpan(4, 4));
+            if (tfdt != null && tfdt.Value.Payload.Length >= 12)
+                dts = tfdt.Value.Payload[0] == 1 ? BinaryPrimitives.ReadUInt64BigEndian(tfdt.Value.Payload.AsSpan(4, 8)) : BinaryPrimitives.ReadUInt32BigEndian(tfdt.Value.Payload.AsSpan(4, 4));
             uint defDur = 0, defSize = 0;
             if (tfhd != null)
             {
                 var p = tfhd.Value.Payload; var flags = ReadU24(p, 0); var pos = 8;
-                if ((flags & 1) != 0) pos += 8; if ((flags & 2) != 0) pos += 4;
+                if ((flags & 1) != 0) pos += 8;
+                if ((flags & 2) != 0) pos += 4;
                 if ((flags & 8) != 0 && pos + 4 <= p.Length) { defDur = ReadU32(p, pos); pos += 4; }
                 if ((flags & 16) != 0 && pos + 4 <= p.Length) defSize = ReadU32(p, pos);
             }
             var p2 = trun.Value.Payload; if (p2.Length < 8) continue;
             var flags2 = ReadU24(p2, 0); var count = ReadU32(p2, 4); var pos2 = 8;
-            if ((flags2 & 1) != 0) pos2 += 4; if ((flags2 & 4) != 0) pos2 += 4;
-            var dataPos = 0;
+            int dataPos = 0;
+            if ((flags2 & 1) != 0)
+            {
+                var dataOffset = unchecked((int)ReadU32(p2, pos2));
+                pos2 += 4;
+                // In this parser mdat.Payload begins at byte zero. A positive trun
+                // data_offset is commonly relative to the start of moof, so when the
+                // fragment was supplied as separate moof/mdat boxes the corresponding
+                // offset into mdat is dataOffset minus the moof size (box header + payload).
+                // Keep zero for the common CMAF layout and reject offsets that cannot
+                // be mapped safely rather than reading unrelated bytes.
+                var moofSize = 8 + moof.Length;
+                if (dataOffset >= moofSize && dataOffset - moofSize <= mdat.Length)
+                    dataPos = dataOffset - moofSize;
+            }
+            if ((flags2 & 4) != 0) pos2 += 4;
             for (uint i = 0; i < count && pos2 <= p2.Length; i++)
             {
                 var dur = defDur; var size = defSize; var sf = 0u; var cto = 0;
@@ -160,7 +217,8 @@ internal sealed class NativeFmp4TsMuxer
                 if ((flags2 & 0x800) != 0) { cto = (int)ReadU32(p2, pos2); pos2 += 4; }
                 if (size == 0 || dataPos + size > mdat.Length) break;
                 result.Add(new Sample(mdat.AsSpan(dataPos, checked((int)size)).ToArray(), dts, cto, (sf & 0x10000) == 0));
-                dts += dur; dataPos += checked((int)size);
+                dts += dur;
+                dataPos += checked((int)size);
             }
         }
         return result;
