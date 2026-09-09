@@ -95,19 +95,19 @@ internal static class PipeUtil
         if (!string.IsNullOrEmpty(customDest)) command.Append(" -re ");
         foreach (var item in pipeNames)
         {
-            if (OperatingSystem.IsWindows()) command.Append($" -i \\\"\\\\.\\pipe\\{item}\\\" ");
-            else command.Append($" -i \\\"{Path.Combine(pipeDir, item)}\\\" ");
+            if (OperatingSystem.IsWindows()) command.Append($" -i \"\\\\.\\pipe\\{item}\" ");
+            else command.Append($" -i \"{Path.Combine(pipeDir, item)}\" ");
         }
         for (var i = 0; i < pipeNames.Length; i++) command.Append($" -map {i} ");
         command.Append(" -strict unofficial -c copy ");
-        command.Append($" -metadata date=\\\"{dateString}\\\" -ignore_unknown -copy_unknown ");
+        command.Append($" -metadata date=\"{dateString}\" -ignore_unknown -copy_unknown ");
         if (!string.IsNullOrEmpty(customDest))
         {
             if (customDest.Trim().StartsWith('-')) command.Append(customDest);
-            else command.Append($" -f mpegts -shortest \\\"{customDest}\\\"");
+            else command.Append($" -f mpegts -shortest \"{customDest}\"");
             Logger.WarnMarkUp($"[deepskyblue1]{command.ToString().EscapeMarkup()}[/]");
         }
-        else command.Append($" -f mpegts -shortest \\\"{outputPath}\\\"");
+        else command.Append($" -f mpegts -shortest \"{outputPath}\"");
 
         using var p = new Process { StartInfo = new ProcessStartInfo {
             WorkingDirectory = Environment.CurrentDirectory, FileName = binary, Arguments = command.ToString(),
