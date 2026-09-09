@@ -9,6 +9,8 @@ namespace N_m3u8DL_RE.Util;
 
 internal static class PipeUtil
 {
+    private const string StreamPipeOutputEnvironmentVariable = "N_M3U8_STREAM_PIPE_OUTPUT";
+
     public static Stream CreatePipe(string pipeName)
     {
         if (OperatingSystem.IsWindows())
@@ -38,8 +40,66 @@ internal static class PipeUtil
         return await Task.Run(async () =>
         {
             await Task.Delay(1000);
+
+            // FFmpeg-free streaming mode for a single already-muxed stream.
+            // The destination is expected to be a FIFO/pipe or another streaming sink.
+            // This deliberately refuses multi-track input because copying separate audio
+            // and video pipes would not produce a valid muxed MPEG-TS stream.
+            var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
+            if (!string.IsNullOrWhiteSpace(streamOutput))
+            {
+                if (pipeNames.Length != 1)
+                {
+                    Logger.ErrorMarkUp($"[red]{StreamPipeOutputEnvironmentVariable} requires exactly one selected non-subtitle stream; refusing to invoke FFmpeg.[/]");
+                    return false;
+                }
+
+                Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free live pipe output:[/] {streamOutput.EscapeMarkup()}");
+                return await ForwardPipeAsync(pipeNames[0], streamOutput);
+            }
+
             return StartPipeMux(binary, pipeNames, outputPath);
         });
+    }
+
+    /// <summary>
+    /// Forward one N_m3u8 pipe directly to a streaming destination without FFmpeg.
+    /// The destination must be a FIFO/pipe/socket-like sink; it is never treated as a
+    /// regular growing recording file by this method.
+    /// </summary>
+    private static async Task<bool> ForwardPipeAsync(string pipeName, string outputPath)
+    {
+        try
+        {
+            var pipePath = OperatingSystem.IsWindows()
+                ? $"\\\\.\\pipe\\{pipeName}"
+                : Path.Combine(Path.GetTempPath(), pipeName);
+
+            await using var input = new FileStream(
+                pipePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite,
+                bufferSize: 1024 * 1024,
+                options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+            await using var output = new FileStream(
+                outputPath,
+                FileMode.Open,
+                FileAccess.Write,
+                FileShare.ReadWrite,
+                bufferSize: 1024 * 1024,
+                options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+            await input.CopyToAsync(output);
+            await output.FlushAsync();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.ErrorMarkUp($"[red]Live pipe forwarding failed: {ex.Message.EscapeMarkup()}[/]");
+            return false;
+        }
     }
 
     public static bool StartPipeMux(string binary, string[] pipeNames, string outputPath)
