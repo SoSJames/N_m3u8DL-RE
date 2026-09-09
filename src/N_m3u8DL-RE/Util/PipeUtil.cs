@@ -99,14 +99,14 @@ internal static class PipeUtil
         var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(streamOutput))
         {
-            return NativeMuxTasks.GetOrAdd(streamOutput, _ => Task.Run(async () =>
+            return NativeMuxTasks.GetOrAdd(streamOutput, key => Task.Run(async () =>
             {
                 Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
                 Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
                 Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
                 var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput);
                 Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
-                NativePipeRegistries.TryRemove(streamOutput, out _);
+                NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
                 return result;
             }));
         }
