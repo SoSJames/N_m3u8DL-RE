@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -25,6 +25,12 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="N_m3u8DL-RE.Tests" />
+  </ItemGroup>
+
+  <!-- The CI build populates this directory with the official Shaka Packager
+       binaries before publish. They are embedded into the N_m3u8DL-RE executable. -->
+  <ItemGroup Condition="Exists('Assets\Shaka')">
+    <EmbeddedResource Include="Assets\Shaka\**\*" />
   </ItemGroup>
 
 </Project>
