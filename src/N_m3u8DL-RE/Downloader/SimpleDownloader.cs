@@ -23,6 +23,7 @@ internal class SimpleDownloader : IDownloader
 
     public async Task<DownloadResult?> DownloadSegmentAsync(MediaSegment segment, string savePath, SpeedContainer speedContainer, Dictionary<string, string>? headers = null)
     {
+        Logger.WarnMarkUp($"[PIPE-TRACE] DOWNLOAD START idx={segment.Index} path={Path.GetFileName(savePath)}");
         var url = segment.Url;
         var (des, dResult) = await DownClipAsync(url, savePath, speedContainer, segment.StartRange, segment.StopRange, headers, DownloaderConfig.MyOptions.DownloadRetryCount);
         if (dResult is { Success: true } && dResult.ActualFilePath != des)
@@ -47,31 +48,36 @@ internal class SimpleDownloader : IDownloader
                 {
                     var key = segment.EncryptInfo.Key;
                     var nonce = segment.EncryptInfo.IV;
-
                     var fileBytes = File.ReadAllBytes(dResult.ActualFilePath);
                     var decrypted = ChaCha20Util.DecryptPer1024Bytes(fileBytes, key!, nonce!);
                     await File.WriteAllBytesAsync(dResult.ActualFilePath, decrypted);
                     break;
                 }
                 case EncryptMethod.SAMPLE_AES_CTR:
-                    // throw new NotSupportedException("SAMPLE-AES-CTR");
                     break;
             }
 
-            // Image头处理
             if (dResult.ImageHeader)
             {
                 await ImageHeaderUtil.ProcessAsync(dResult.ActualFilePath);
             }
-            // Gzip解压
             if (dResult.GzipHeader)
             {
                 await OtherUtil.DeGzipFileAsync(dResult.ActualFilePath);
             }
 
-            // 处理完成后改名
             File.Move(dResult.ActualFilePath, des);
             dResult.ActualFilePath = des;
+        }
+        if (dResult is { Success: true })
+        {
+            long size = 0;
+            try { size = new FileInfo(dResult.ActualFilePath).Length; } catch { }
+            Logger.WarnMarkUp($"[PIPE-TRACE] DOWNLOAD DONE idx={segment.Index} bytes={size} path={Path.GetFileName(dResult.ActualFilePath)}");
+        }
+        else
+        {
+            Logger.WarnMarkUp($"[PIPE-TRACE] DOWNLOAD FAILED idx={segment.Index}");
         }
         return dResult;
     }
@@ -85,14 +91,12 @@ internal class SimpleDownloader : IDownloader
             cancellationTokenSource = new();
             var des = Path.ChangeExtension(path, null);
 
-            // 已下载跳过
             if (File.Exists(des))
             {
                 speedContainer.Add(new FileInfo(des).Length);
                 return (des, new DownloadResult() { ActualContentLength = 0, ActualFilePath = des });
             }
 
-            // 已解密跳过
             var dec = Path.Combine(Path.GetDirectoryName(des)!, Path.GetFileNameWithoutExtension(des) + "_dec" + Path.GetExtension(des));
             if (File.Exists(dec))
             {
@@ -100,7 +104,6 @@ internal class SimpleDownloader : IDownloader
                 return (dec, new DownloadResult() { ActualContentLength = 0, ActualFilePath = dec });
             }
 
-            // 另起线程进行监控
             var cts = cancellationTokenSource;
             using var watcher = Task.Factory.StartNew(async () =>
             {
@@ -117,11 +120,8 @@ internal class SimpleDownloader : IDownloader
                 }
             });
 
-            // 调用下载
             var result = await DownloadUtil.DownloadToFileAsync(url, path, speedContainer, cancellationTokenSource, headers, fromPosition, toPosition);
             return (des, result);
-
-            throw new Exception("please retry");
         }
         catch (Exception ex)
         {
@@ -138,14 +138,12 @@ internal class SimpleDownloader : IDownloader
                 Logger.Extra($"The retry attempts have been exhausted and the download of this segment has failed.{Environment.NewLine}Exception  => {ex.Message}{Environment.NewLine}Url        => {url}");
                 Logger.WarnMarkUp($"[grey]{ex.Message.EscapeMarkup()}[/]");
             }
-            // throw new Exception("download failed", ex);
             return default;
         }
         finally
         {
             if (cancellationTokenSource != null)
             {
-                // 调用后销毁
                 cancellationTokenSource.Dispose();
                 cancellationTokenSource = null;
             }
