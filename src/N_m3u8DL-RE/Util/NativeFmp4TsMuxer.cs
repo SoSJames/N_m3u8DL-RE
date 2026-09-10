@@ -30,14 +30,14 @@ internal sealed class NativeFmp4TsMuxer
         {
             Logger.InfoMarkUp($"[yellow]Native mux opening input pipe 0: {pipeNames[0].EscapeMarkup()}[/]");
             await using var p0 = OpenPipe(pipeNames[0]);
-            Logger.InfoMarkUp("[green]Native mux input pipe 0 opened.[/"]");
+            Logger.InfoMarkUp("[green]Native mux input pipe 0 opened.[/]");
             Logger.InfoMarkUp($"[yellow]Native mux opening input pipe 1: {pipeNames[1].EscapeMarkup()}[/]");
             await using var p1 = OpenPipe(pipeNames[1]);
-            Logger.InfoMarkUp("[green]Native mux input pipe 1 opened.[/"]");
+            Logger.InfoMarkUp("[green]Native mux input pipe 1 opened.[/]");
             Logger.InfoMarkUp($"[yellow]Native mux opening output FIFO: {outputPath.EscapeMarkup()}[/]");
             await using var dst = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
                 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            Logger.InfoMarkUp("[green]Native mux output FIFO opened.[/"]");
+            Logger.InfoMarkUp("[green]Native mux output FIFO opened.[/]");
             var mux = new NativeFmp4TsMuxer(dst);
             await Task.WhenAll(mux.ReadPipeAsync(p0, 0), mux.ReadPipeAsync(p1, 1));
             await dst.FlushAsync();
@@ -57,7 +57,7 @@ internal sealed class NativeFmp4TsMuxer
 
     private async Task ReadPipeAsync(Stream pipe, int pipeIndex)
     {
-        Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex} started.[/"]);
+        Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex} started.[/]");
         var r = new BoxReader(pipe);
         Track? track = null;
         while (true)
@@ -65,7 +65,7 @@ internal sealed class NativeFmp4TsMuxer
             var box = await r.ReadAsync();
             if (box == null)
             {
-                Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: input EOF.[/"]);
+                Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: input EOF.[/]");
                 break;
             }
 
@@ -77,12 +77,12 @@ internal sealed class NativeFmp4TsMuxer
                 if (track.Kind == Kind.Video)
                 {
                     video = track;
-                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: video init codec={track.Codec}; timescale={track.TimeScale}; nalLength={track.NalLengthSize}.[/"]);
+                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: video init codec={track.Codec}; timescale={track.TimeScale}; nalLength={track.NalLengthSize}.[/]");
                 }
                 else
                 {
                     audio = track;
-                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: audio init timescale={track.TimeScale}; AAC profile={track.AacProfile}; freqIndex={track.AacFreq}; channels={track.Channels}.[/"]);
+                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: audio init timescale={track.TimeScale}; AAC profile={track.AacProfile}; freqIndex={track.AacFreq}; channels={track.Channels}.[/]");
                 }
                 continue;
             }
@@ -102,7 +102,7 @@ internal sealed class NativeFmp4TsMuxer
                 continue;
             }
             var samples = ParseFragment(box.Value.Payload, mdat.Value.Payload, track);
-            Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: moof #{moofCount} track={track.Kind} mdat={mdat.Value.Payload.Length} samples={samples.Count}.[/"]);
+            Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: moof #{moofCount} track={track.Kind} mdat={mdat.Value.Payload.Length} samples={samples.Count}.[/]");
             foreach (var sample in samples)
                 await EmitAsync(track, sample);
         }
@@ -128,7 +128,7 @@ internal sealed class NativeFmp4TsMuxer
             {
                 WritePsi();
                 psiWritten = true;
-                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/"]);
+                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/]");
             }
             var pts = Scale90((long)s.Dts + s.Cto, t.TimeScale);
             var dts = Scale90((long)s.Dts, t.TimeScale);
