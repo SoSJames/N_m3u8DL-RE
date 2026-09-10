@@ -23,7 +23,26 @@ internal static class PipeUtil
         Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe called name={pipeName.EscapeMarkup()} thread={Environment.CurrentManagedThreadId}");
         Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe caller={new StackTrace(1, true).ToString().Replace(Environment.NewLine, " | ").EscapeMarkup()}");
 
-        if (OperatingSystem.IsWindows())
+        // Capture scheduler state at entry. This is diagnostic only; do not alter
+        // ThreadPool settings here. If the second producer is being starved, this
+        // tells us whether the worker pool is actually exhausted.
+        try
+        {
+            ThreadPool.GetAvailableThreads(out var availableWorkers, out var availableIo);
+            ThreadPool.GetMaxThreads(out var maxWorkers, out var maxIo);
+            ThreadPool.GetMinThreads(out var minWorkers, out var minIo);
+            Logger.WarnMarkUp($"[PIPE-TRACE] ThreadPool entry workers={availableWorkers}/{maxWorkers} io={availableIo}/{maxIo} min={minWorkers}/{minIo}");
+        }
+        catch (Exception ex)
+        {
+            Logger.WarnMarkUp($"[PIPE-TRACE] ThreadPool diagnostics failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}");
+        }
+
+        Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before OS check");
+        var isWindows = OperatingSystem.IsWindows();
+        Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: OS check complete windows={isWindows}");
+
+        if (isWindows)
         {
             Logger.InfoMarkUp($"[yellow]PIPE create (Windows): {pipeName.EscapeMarkup()}[/]");
             var stream = new NamedPipeServerStream(pipeName, PipeDirection.InOut);
@@ -31,40 +50,62 @@ internal static class PipeUtil
             return stream;
         }
 
-        var path = Path.Combine(Path.GetTempPath(), pipeName);
+        Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before Path.GetTempPath");
+        var tempPath = Path.GetTempPath();
+        Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: Path.GetTempPath complete path={tempPath.EscapeMarkup()}");
+
+        Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before Path.Combine");
+        var path = Path.Combine(tempPath, pipeName);
+        Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: Path.Combine complete path={path.EscapeMarkup()}");
+
         Logger.InfoMarkUp($"[yellow]PIPE create (FIFO) begin: {path.EscapeMarkup()}[/]");
 
         try
         {
-            if (File.Exists(path))
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before File.Exists");
+            var exists = File.Exists(path);
+            Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: File.Exists complete exists={exists}");
+
+            if (exists)
             {
                 Logger.WarnMarkUp($"[PIPE-TRACE] FIFO path already exists; removing stale path: {path.EscapeMarkup()}");
+                Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before File.Delete");
                 File.Delete(path);
+                Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: File.Delete complete");
             }
 
             Logger.InfoMarkUp($"[yellow]PIPE mkfifo begin: {path.EscapeMarkup()}[/]");
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before mkfifo");
             var rc = mkfifo(path, 0x180u); // 0600
             var errno = Marshal.GetLastWin32Error();
+            Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: mkfifo complete rc={rc} errno={errno}");
             Logger.InfoMarkUp($"[yellow]PIPE mkfifo returned rc={rc} errno={errno}[/]");
             if (rc != 0)
                 throw new IOException($"mkfifo failed for '{path}' with errno {errno}");
 
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before File.GetAttributes");
             var attributes = File.GetAttributes(path);
+            Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: File.GetAttributes complete attributes={attributes}");
             Logger.InfoMarkUp($"[yellow]PIPE FIFO exists/type={attributes}; opening read/write[/]");
 
             // Open an existing FIFO read/write. This avoids waiting for a separate
             // reader/writer and keeps CreatePipe non-blocking while the native muxer
             // attaches to the FIFO asynchronously.
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before FileStream open");
             var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: FileStream open complete");
             Logger.InfoMarkUp($"[yellow]PIPE opened: {path.EscapeMarkup()}[/]");
 
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before native registration");
             RegisterNativePipeAndMaybeStartMux(pipeName);
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: native registration complete");
 
             // IMPORTANT: return immediately. The producer must never wait for the
             // native muxer here (or on its first write), because CreatePipe/CopyTo
             // runs in the parallel stream workers. Native mux startup is triggered
             // once both FIFOs are registered, and FIFO backpressure is allowed to
             // regulate the producers naturally.
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: returning stream");
             return stream;
         }
         catch (Exception ex)
