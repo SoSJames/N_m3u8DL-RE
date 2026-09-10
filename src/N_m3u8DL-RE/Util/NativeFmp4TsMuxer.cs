@@ -168,14 +168,13 @@ internal sealed class NativeFmp4TsMuxer
         var result = new List<Sample>(); foreach (var traf in FindBoxes(moof, "traf"))
         {
             var tfhd = FindBox(traf.Payload, "tfhd"); var tfdt = FindBox(traf.Payload, "tfdt"); var trun = FindBox(traf.Payload, "trun"); if (trun == null) continue; var tfhdPayload = tfhd?.Payload; var trunPayload = trun.Value.Payload; if (trunPayload.Length < 8) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: malformed trun"); continue; }
-            var flags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(0, 4)); var count = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(4, 4)); var pos = 8;
-            long dts = tfdt == null ? 0 : ParseTfdt(tfdt.Value.Payload); var dataOffset = 0; if ((flags & 0x000001) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun data_offset missing"); dataOffset = BinaryPrimitives.ReadInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
-            uint firstFlags = 0; if ((flags & 0x000004) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun first_sample_flags missing"); firstFlags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
-            var defaultDuration = ReadDefaultDuration(tfhdPayload, t); var defaultSize = ReadDefaultSize(tfhdPayload, t); var defaultFlags = ReadDefaultFlags(tfhdPayload, t);
-            var sampleBase = dataOffset != 0 ? dataOffset : 0;
+            var flags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(0, 4)) & 0xFFFFFF; var count = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(4, 4)); var pos = 8; long dts = ParseTfdt(tfdt?.Payload ?? Array.Empty<byte>()); uint defaultDur = ReadDefaultDuration(tfhdPayload, t), defaultSize = ReadDefaultSize(tfhdPayload, t), defaultFlags = ReadDefaultFlags(tfhdPayload, t); var dataOffset = 0;
+            if ((flags & 1) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun data offset missing"); dataOffset = BinaryPrimitives.ReadInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+            if ((flags & 4) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun first sample flags missing"); defaultFlags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+            var sampleBase = dataOffset > 0 ? dataOffset - 8 : 0;
             for (uint i = 0; i < count; i++)
             {
-                uint dur = defaultDuration, size = defaultSize, sflags = i == 0 && (flags & 0x000004) != 0 ? firstFlags : defaultFlags; int cto = 0;
+                uint dur = defaultDur, size = defaultSize, sflags = defaultFlags; int cto = 0;
                 if ((flags & 0x000100) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun sample duration missing"); dur = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
                 if ((flags & 0x000200) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun sample size missing"); size = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
                 if ((flags & 0x000400) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun sample flags missing"); sflags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
@@ -244,8 +243,38 @@ internal sealed class NativeFmp4TsMuxer
     private readonly record struct Sample(byte[] Data, long Dts, int Cto, uint Duration, uint Flags);
 
     private static IEnumerable<Box> Boxes(byte[] data) { var pos = 0; while (pos + 8 <= data.Length) { var size = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos, 4)); var type = Encoding.ASCII.GetString(data, pos + 4, 4); if (size < 8 || size > data.Length - pos) yield break; yield return new Box(type, data.AsSpan(pos + 8, checked((int)size - 8)).ToArray()); pos += checked((int)size); } }
-    private static IEnumerable<Box> FindBoxes(byte[] data, string type) => Boxes(data).Where(b => b.Type == type);
-    private static Box? FindBox(byte[] data, string type) => Boxes(data).FirstOrDefault(b => b.Type == type) is var b && b.Payload != null && b.Type == type ? b : null;
+
+    private static IEnumerable<Box> FindBoxes(byte[] data, string type)
+    {
+        foreach (var box in Boxes(data))
+        {
+            if (box.Type == type) yield return box;
+            if (IsContainerBox(box.Type))
+            {
+                foreach (var nested in FindBoxes(box.Payload, type)) yield return nested;
+            }
+        }
+    }
+
+    private static Box? FindBox(byte[] data, string type)
+    {
+        foreach (var box in Boxes(data))
+        {
+            if (box.Type == type) return box;
+            if (IsContainerBox(box.Type))
+            {
+                var nested = FindBox(box.Payload, type);
+                if (nested != null) return nested;
+            }
+        }
+        return null;
+    }
+
+    private static bool IsContainerBox(string type) => type is
+        "moov" or "trak" or "mdia" or "minf" or "stbl" or "stsd" or
+        "edts" or "dinf" or "mvex" or "moof" or "traf" or "mfra" or
+        "avc1" or "avc3" or "hvc1" or "hev1" or "encv" or "mp4a" or "enca";
+
     private static byte[]? FindDescriptor(byte[] data, byte wanted) { for (var i = 4; i + 2 < data.Length; i++) if (data[i] == wanted) { var len = data[i + 1] & 0x7F; if (i + 2 + len <= data.Length) return data.AsSpan(i + 2, len).ToArray(); } return null; }
     private static uint Frequency(int idx) => idx switch { 0 => 96000, 1 => 88200, 2 => 64000, 3 => 48000, 4 => 44100, 5 => 32000, 6 => 24000, 7 => 22050, 8 => 16000, 9 => 12000, 10 => 11025, 11 => 8000, _ => 48000 };
 }
