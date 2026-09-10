@@ -30,14 +30,14 @@ internal sealed class NativeFmp4TsMuxer
         {
             Logger.InfoMarkUp($"[yellow]Native mux opening input pipe 0: {pipeNames[0].EscapeMarkup()}[/]");
             await using var p0 = OpenPipe(pipeNames[0]);
-            Logger.InfoMarkUp("[green]Native mux input pipe 0 opened.[/]");
+            Logger.InfoMarkUp("[green]Native mux input pipe 0 opened.[/"]");
             Logger.InfoMarkUp($"[yellow]Native mux opening input pipe 1: {pipeNames[1].EscapeMarkup()}[/]");
             await using var p1 = OpenPipe(pipeNames[1]);
-            Logger.InfoMarkUp("[green]Native mux input pipe 1 opened.[/]");
+            Logger.InfoMarkUp("[green]Native mux input pipe 1 opened.[/"]");
             Logger.InfoMarkUp($"[yellow]Native mux opening output FIFO: {outputPath.EscapeMarkup()}[/]");
             await using var dst = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
                 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            Logger.InfoMarkUp("[green]Native mux output FIFO opened.[/]");
+            Logger.InfoMarkUp("[green]Native mux output FIFO opened.[/"]");
             var mux = new NativeFmp4TsMuxer(dst);
             await Task.WhenAll(mux.ReadPipeAsync(p0, 0), mux.ReadPipeAsync(p1, 1));
             await dst.FlushAsync();
@@ -57,7 +57,7 @@ internal sealed class NativeFmp4TsMuxer
 
     private async Task ReadPipeAsync(Stream pipe, int pipeIndex)
     {
-        Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex} started.[/]");
+        Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex} started.[/"]);
         var r = new BoxReader(pipe);
         Track? track = null;
         while (true)
@@ -65,7 +65,7 @@ internal sealed class NativeFmp4TsMuxer
             var box = await r.ReadAsync();
             if (box == null)
             {
-                Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: input EOF.[/]");
+                Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: input EOF.[/"]);
                 break;
             }
 
@@ -77,12 +77,12 @@ internal sealed class NativeFmp4TsMuxer
                 if (track.Kind == Kind.Video)
                 {
                     video = track;
-                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: video init codec={track.Codec}; timescale={track.TimeScale}; nalLength={track.NalLengthSize}.[/]");
+                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: video init codec={track.Codec}; timescale={track.TimeScale}; nalLength={track.NalLengthSize}.[/"]);
                 }
                 else
                 {
                     audio = track;
-                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: audio init timescale={track.TimeScale}; AAC profile={track.AacProfile}; freqIndex={track.AacFreq}; channels={track.Channels}.[/]");
+                    Logger.InfoMarkUp($"[green]Native mux reader {pipeIndex}: audio init timescale={track.TimeScale}; AAC profile={track.AacProfile}; freqIndex={track.AacFreq}; channels={track.Channels}.[/"]);
                 }
                 continue;
             }
@@ -102,7 +102,7 @@ internal sealed class NativeFmp4TsMuxer
                 continue;
             }
             var samples = ParseFragment(box.Value.Payload, mdat.Value.Payload, track);
-            Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: moof #{moofCount} track={track.Kind} mdat={mdat.Value.Payload.Length} samples={samples.Count}.[/]");
+            Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: moof #{moofCount} track={track.Kind} mdat={mdat.Value.Payload.Length} samples={samples.Count}.[/"]);
             foreach (var sample in samples)
                 await EmitAsync(track, sample);
         }
@@ -114,7 +114,7 @@ internal sealed class NativeFmp4TsMuxer
         foreach (var box in Boxes(payload))
         {
             Logger.WarnMarkUp($"[PIPE-DIAG] {new string(' ', depth * 2)}{box.Type} bytes={box.Payload.Length}");
-            if (box.Type is "trak" or "mdia" or "minf" or "stbl" or "stsd" or "avc1" or "hvc1" or "hev1" or "mp4a" or "moov" or "edts" or "dinf" or "mvex" or "moof" or "traf")
+            if (box.Type is "trak" or "mdia" or "minf" or "stbl" or "stsd" or "avc1" or "avc3" or "hvc1" or "hev1" or "encv" or "mp4a" or "enca" or "moov" or "edts" or "dinf" or "mvex" or "moof" or "traf")
                 LogBoxTree(box.Payload, box.Type, depth + 1, maxDepth);
         }
     }
@@ -128,7 +128,7 @@ internal sealed class NativeFmp4TsMuxer
             {
                 WritePsi();
                 psiWritten = true;
-                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/]");
+                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/"]);
             }
             var pts = Scale90((long)s.Dts + s.Cto, t.TimeScale);
             var dts = Scale90((long)s.Dts, t.TimeScale);
@@ -172,10 +172,16 @@ internal sealed class NativeFmp4TsMuxer
             }
             if (t.TimeScale == 0) t.TimeScale = t.Kind == Kind.Audio ? 48000u : 90000u;
 
+            var stsd = FindBox(trak.Payload, "stsd");
+            if (stsd == null) throw new InvalidDataException("Track has no stsd");
+            var entry = FindSampleEntry(stsd.Value.Payload, t.Kind == Kind.Video);
+            if (entry == null) throw new InvalidDataException($"No supported {(t.Kind == Kind.Video ? "video" : "audio")} sample entry");
+            Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} sample-entry={entry.Value.Type} bytes={entry.Value.Payload.Length}");
+
             if (t.Kind == Kind.Video)
             {
-                var avc = FindBox(trak.Payload, "avcC");
-                var hvc = FindBox(trak.Payload, "hvcC");
+                var avc = FindBoxInSampleEntry(entry.Value.Payload, entry.Value.Type, "avcC");
+                var hvc = FindBoxInSampleEntry(entry.Value.Payload, entry.Value.Type, "hvcC");
                 Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} video avcC={(avc != null ? avc.Value.Payload.Length : 0)} hvcC={(hvc != null ? hvc.Value.Payload.Length : 0)}");
                 if (avc != null && avc.Value.Payload.Length >= 5) { t.Codec = Codec.H264; t.NalLengthSize = (avc.Value.Payload[4] & 3) + 1; }
                 else if (hvc != null && hvc.Value.Payload.Length >= 22) { t.Codec = Codec.H265; t.NalLengthSize = (hvc.Value.Payload[21] & 3) + 1; }
@@ -183,7 +189,7 @@ internal sealed class NativeFmp4TsMuxer
             }
             else
             {
-                var esds = FindBox(trak.Payload, "esds");
+                var esds = FindBoxInSampleEntry(entry.Value.Payload, entry.Value.Type, "esds");
                 var asc = esds == null ? null : FindDescriptor(esds.Value.Payload, 0x05);
                 Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} audio esds={(esds != null ? esds.Value.Payload.Length : 0)} asc={(asc != null ? asc.Length : 0)}");
                 if (asc == null || asc.Length < 2) throw new InvalidDataException("AAC init has no AudioSpecificConfig");
@@ -198,6 +204,44 @@ internal sealed class NativeFmp4TsMuxer
         }
         throw new InvalidDataException("No supported track in moov");
     }
+
+    private static Box? FindSampleEntry(byte[] stsd, bool video)
+    {
+        if (stsd.Length < 8) return null;
+        var count = BinaryPrimitives.ReadUInt32BigEndian(stsd.AsSpan(4, 4));
+        var pos = 8;
+        for (uint i = 0; i < count && pos + 8 <= stsd.Length; i++)
+        {
+            var size = BinaryPrimitives.ReadUInt32BigEndian(stsd.AsSpan(pos, 4));
+            if (size < 8 || size > stsd.Length - pos) return null;
+            var type = Encoding.ASCII.GetString(stsd, pos + 4, 4);
+            var payload = stsd.AsSpan(pos + 8, checked((int)size - 8)).ToArray();
+            if ((video && IsVideoSampleEntry(type)) || (!video && IsAudioSampleEntry(type))) return new Box(type, payload);
+            pos += checked((int)size);
+        }
+        return null;
+    }
+
+    private static Box? FindBoxInSampleEntry(byte[] payload, string entryType, string target)
+    {
+        var fixedHeader = IsVideoSampleEntry(entryType) ? 78 : IsAudioSampleEntry(entryType) ? 28 : 0;
+        if (payload.Length < fixedHeader) return null;
+        var children = payload.AsSpan(fixedHeader).ToArray();
+        var found = FindBox(children, target);
+        if (found != null) return found;
+        foreach (var child in Boxes(children))
+        {
+            if (IsVideoSampleEntry(child.Type) || IsAudioSampleEntry(child.Type))
+            {
+                found = FindBoxInSampleEntry(child.Payload, child.Type, target);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private static bool IsVideoSampleEntry(string type) => type is "avc1" or "avc3" or "hvc1" or "hev1" or "encv";
+    private static bool IsAudioSampleEntry(string type) => type is "mp4a" or "enca";
 
     private static List<Sample> ParseFragment(byte[] moof, byte[] mdat, Track t)
     {
