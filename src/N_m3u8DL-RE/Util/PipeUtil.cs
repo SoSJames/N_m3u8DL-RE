@@ -61,7 +61,7 @@ internal static class PipeUtil
 
             Logger.InfoMarkUp($"[yellow]PIPE mkfifo begin: {path.EscapeMarkup()}[/]");
             Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before mkfifo");
-            var rc = mkfifo(path, 0x180u); // 0600
+            var rc = mkfifo(path, 0x180u);
             var errno = Marshal.GetLastWin32Error();
             Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: mkfifo complete rc={rc} errno={errno}");
             Logger.InfoMarkUp($"[yellow]PIPE mkfifo returned rc={rc} errno={errno}[/]");
@@ -73,9 +73,6 @@ internal static class PipeUtil
             Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: File.GetAttributes complete attributes={attributes}");
             Logger.InfoMarkUp($"[yellow]PIPE FIFO exists/type={attributes}; opening read/write[/]");
 
-            // Open an existing FIFO read/write. This avoids waiting for a separate
-            // reader/writer and keeps CreatePipe non-blocking while the native muxer
-            // attaches to the FIFO asynchronously.
             Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before FileStream open");
             var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
             Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: FileStream open complete");
@@ -84,12 +81,6 @@ internal static class PipeUtil
             Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before native registration");
             RegisterNativePipeAndMaybeStartMux(pipeName);
             Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: native registration complete");
-
-            // IMPORTANT: return immediately. The producer must never wait for the
-            // native muxer here (or on its first write), because CreatePipe/CopyTo
-            // runs in the parallel stream workers. Native mux startup is triggered
-            // once both FIFOs are registered, and FIFO backpressure is allowed to
-            // regulate the producers naturally.
             Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: returning stream");
             return stream;
         }
@@ -109,11 +100,6 @@ internal static class PipeUtil
         var registry = NativePipeRegistries.GetOrAdd(streamOutput, _ => new ConcurrentDictionary<string, byte>());
         registry.TryAdd(pipeName, 0);
         Logger.InfoMarkUp($"[yellow]PIPE registration: {pipeName.EscapeMarkup()} ({registry.Count}/2)[/]");
-
-        // The native muxer is deliberately fixed to exactly two inputs: video + audio.
-        // Start it as soon as both pipes exist instead of depending on the selected-stream
-        // count, which may include an unpiped/extra track and otherwise leaves the muxer
-        // never started.
         if (registry.Count != 2)
             return;
 
@@ -134,31 +120,37 @@ internal static class PipeUtil
             var task = NativeMuxTasks.GetOrAdd(streamOutput, key =>
             {
                 Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task queueing on dedicated thread.[/]");
-                return Task.Factory.StartNew(async () =>
-                {
-                    try
+                // Keep the LongRunning delegate synchronous. The previous async lambda
+                // + Unwrap construction never reached its first log in the live test.
+                // A synchronous delegate makes entry onto the dedicated thread explicit,
+                // then blocks that dedicated thread while the native async I/O pipeline runs.
+                return Task.Factory.StartNew(
+                    () =>
                     {
-                        Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
-                        Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
-                        Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
-
-                        // The native muxer is a long-lived I/O pipeline. Run its initial
-                        // FIFO attachment on a dedicated thread so it cannot be delayed
-                        // behind producer/download work on the managed ThreadPool.
-                        var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput).ConfigureAwait(false);
-                        Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
-                        return result;
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
-                        return false;
-                    }
-                    finally
-                    {
-                        NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
-                    }
-                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+                        try
+                        {
+                            Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
+                            Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
+                            Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
+                            var result = NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput)
+                                .GetAwaiter()
+                                .GetResult();
+                            Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
+                            return result;
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
+                            return false;
+                        }
+                        finally
+                        {
+                            NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
+                        }
+                    },
+                    CancellationToken.None,
+                    TaskCreationOptions.LongRunning,
+                    TaskScheduler.Default);
             });
             return task;
         }
