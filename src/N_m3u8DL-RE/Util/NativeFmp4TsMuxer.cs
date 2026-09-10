@@ -239,7 +239,18 @@ internal sealed class NativeFmp4TsMuxer
         Array.Fill(ts, (byte)0xFF); ts[0] = 0x47; ts[1] = (byte)((pusi ? 0x40 : 0) | ((pid >> 8) & 0x1F)); ts[2] = (byte)pid; ts[3] = (byte)(0x10 | (cc++ & 0x0F));
     }
 
-    private void WriteRaw(byte[] ts) { output.Write(ts, 0, ts.Length); tsPacketsWritten++; tsBytesWritten += ts.Length; if ((tsPacketsWritten % 100) == 0) Logger.WarnMarkUp($"[PIPE-TS] raw TS packet #{tsPacketsWritten} bytes={ts.Length} cumulativeTsBytes={tsBytesWritten}"); }
+    private void WriteRaw(byte[] ts)
+    {
+        output.Write(ts, 0, ts.Length);
+        tsPacketsWritten++;
+        tsBytesWritten += ts.Length;
+        if (tsPacketsWritten <= 2)
+        {
+            var hex = Convert.ToHexString(ts);
+            Logger.WarnMarkUp($"[PIPE-TS-HEX] packet={tsPacketsWritten} pid={(((ts[1] & 0x1F) << 8) | ts[2])} pusi={(ts[1] & 0x40) != 0} afc={(ts[3] >> 4) & 3} cc={ts[3] & 0x0F} bytes={hex}");
+        }
+        if ((tsPacketsWritten % 100) == 0) Logger.WarnMarkUp($"[PIPE-TS] raw TS packet #{tsPacketsWritten} bytes={ts.Length} cumulativeTsBytes={tsBytesWritten}");
+    }
     private static void WriteCrc(byte[] b, int off, int len) { uint crc = 0xFFFFFFFF; for (var i = off; i < len; i++) { crc ^= (uint)b[i] << 24; for (var j = 0; j < 8; j++) crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ 0x04C11DB7 : crc << 1; } b[len] = (byte)(crc >> 24); b[len + 1] = (byte)(crc >> 16); b[len + 2] = (byte)(crc >> 8); b[len + 3] = (byte)crc; }
     private static void PutPts(byte[] b, int off, long pts, int prefix) { ulong v = (ulong)Math.Max(0, pts) & ((1UL << 33) - 1); b[off] = (byte)(((ulong)(prefix << 4)) | (((v >> 30) & 7) << 1) | 1); b[off + 1] = (byte)(v >> 22); b[off + 2] = (byte)((((v >> 15) & 0x7F) << 1) | 1); b[off + 3] = (byte)(v >> 7); b[off + 4] = (byte)(((v & 0x7F) << 1) | 1); }
 
