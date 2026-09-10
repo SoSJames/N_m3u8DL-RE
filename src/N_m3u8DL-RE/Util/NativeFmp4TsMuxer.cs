@@ -68,9 +68,12 @@ internal sealed class NativeFmp4TsMuxer
                 Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: input EOF.[/]");
                 break;
             }
+
             if (box.Value.Type == "moov")
             {
-                track = ParseInit(box.Value.Payload);
+                Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} received moov bytes={box.Value.Payload.Length}");
+                LogBoxTree(box.Value.Payload, "moov", 0, 4);
+                track = ParseInit(box.Value.Payload, pipeIndex);
                 if (track.Kind == Kind.Video)
                 {
                     video = track;
@@ -83,15 +86,36 @@ internal sealed class NativeFmp4TsMuxer
                 }
                 continue;
             }
-            if (box.Value.Type != "moof") continue;
+
+            if (box.Value.Type != "moof")
+            {
+                Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} ignoring box={box.Value.Type} bytes={box.Value.Payload.Length}");
+                continue;
+            }
+
             moofCount++;
             var mdat = await r.ReadAsync();
             if (mdat == null || mdat.Value.Type != "mdat") throw new InvalidDataException("moof is not followed by mdat");
-            if (track == null) continue;
+            if (track == null)
+            {
+                Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} received media before init: moof bytes={box.Value.Payload.Length}, mdat bytes={mdat.Value.Payload.Length}");
+                continue;
+            }
             var samples = ParseFragment(box.Value.Payload, mdat.Value.Payload, track);
             Logger.InfoMarkUp($"[yellow]Native mux reader {pipeIndex}: moof #{moofCount} track={track.Kind} mdat={mdat.Value.Payload.Length} samples={samples.Count}.[/]");
             foreach (var sample in samples)
                 await EmitAsync(track, sample);
+        }
+    }
+
+    private static void LogBoxTree(byte[] payload, string rootName, int depth, int maxDepth)
+    {
+        if (depth > maxDepth) return;
+        foreach (var box in Boxes(payload))
+        {
+            Logger.WarnMarkUp($"[PIPE-DIAG] {new string(' ', depth * 2)}{box.Type} bytes={box.Payload.Length}");
+            if (box.Type is "trak" or "mdia" or "minf" or "stbl" or "stsd" or "avc1" or "hvc1" or "hev1" or "mp4a" or "moov" or "edts" or "dinf" or "mvex" or "moof" or "traf")
+                LogBoxTree(box.Payload, box.Type, depth + 1, maxDepth);
         }
     }
 
@@ -126,7 +150,7 @@ internal sealed class NativeFmp4TsMuxer
         await Task.CompletedTask;
     }
 
-    private Track ParseInit(byte[] moov)
+    private Track ParseInit(byte[] moov, int pipeIndex)
     {
         foreach (var trak in FindBoxes(moov, "trak"))
         {
@@ -136,6 +160,9 @@ internal sealed class NativeFmp4TsMuxer
             var handler = Encoding.ASCII.GetString(hp, 8, 4);
             var t = new Track { Kind = handler == "vide" ? Kind.Video : handler == "soun" ? Kind.Audio : Kind.Unknown };
             if (t.Kind == Kind.Unknown) continue;
+
+            Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} track handler={handler}");
+
             var mdhd = FindBox(trak.Payload, "mdhd");
             if (mdhd != null)
             {
@@ -144,10 +171,12 @@ internal sealed class NativeFmp4TsMuxer
                 else if (p.Length >= 16) t.TimeScale = BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(12, 4));
             }
             if (t.TimeScale == 0) t.TimeScale = t.Kind == Kind.Audio ? 48000u : 90000u;
+
             if (t.Kind == Kind.Video)
             {
                 var avc = FindBox(trak.Payload, "avcC");
                 var hvc = FindBox(trak.Payload, "hvcC");
+                Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} video avcC={(avc != null ? avc.Value.Payload.Length : 0)} hvcC={(hvc != null ? hvc.Value.Payload.Length : 0)}");
                 if (avc != null && avc.Value.Payload.Length >= 5) { t.Codec = Codec.H264; t.NalLengthSize = (avc.Value.Payload[4] & 3) + 1; }
                 else if (hvc != null && hvc.Value.Payload.Length >= 22) { t.Codec = Codec.H265; t.NalLengthSize = (hvc.Value.Payload[21] & 3) + 1; }
                 else throw new InvalidDataException("Video init has neither avcC nor hvcC");
@@ -156,6 +185,7 @@ internal sealed class NativeFmp4TsMuxer
             {
                 var esds = FindBox(trak.Payload, "esds");
                 var asc = esds == null ? null : FindDescriptor(esds.Value.Payload, 0x05);
+                Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} audio esds={(esds != null ? esds.Value.Payload.Length : 0)} asc={(asc != null ? asc.Length : 0)}");
                 if (asc == null || asc.Length < 2) throw new InvalidDataException("AAC init has no AudioSpecificConfig");
                 t.Asc = asc;
                 var a0 = asc[0]; var a1 = asc[1];
@@ -197,12 +227,6 @@ internal sealed class NativeFmp4TsMuxer
             {
                 var dataOffset = unchecked((int)ReadU32(p2, pos2));
                 pos2 += 4;
-                // In this parser mdat.Payload begins at byte zero. A positive trun
-                // data_offset is commonly relative to the start of moof, so when the
-                // fragment was supplied as separate moof/mdat boxes the corresponding
-                // offset into mdat is dataOffset minus the moof size (box header + payload).
-                // Keep zero for the common CMAF layout and reject offsets that cannot
-                // be mapped safely rather than reading unrelated bytes.
                 var moofSize = 8 + moof.Length;
                 if (dataOffset >= moofSize && dataOffset - moofSize <= mdat.Length)
                     dataPos = dataOffset - moofSize;
