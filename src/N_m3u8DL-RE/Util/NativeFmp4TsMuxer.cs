@@ -206,7 +206,7 @@ internal sealed class NativeFmp4TsMuxer
 
     private void WritePsi()
     {
-        var pat = new byte[188]; var pmt = new byte[188]; FillTs(pat, 0, true, ref pmtCc); var p = 4; pat[p++] = 0; pat[p++] = 0xB0; pat[p++] = 0x0D; pat[p++] = 0; pat[p++] = 1; pat[p++] = 0xC1; pat[p++] = 0; pat[p++] = 0; pat[p++] = 0; pat[p++] = 1; pat[p++] = 0xE0; pat[p++] = (byte)(PmtPid & 0xFF); pat[p++] = 0; WriteCrc(pat, 5, p - 5); FillTs(pmt, PmtPid, true, ref pmtCc); p = 4; pmt[p++] = 0; pmt[p++] = 0xB0; pmt[p++] = 0x17; pmt[p++] = 0; pmt[p++] = 1; pmt[p++] = 0xC1; pmt[p++] = 0; pmt[p++] = 0x00; pmt[p++] = 0xE1; pmt[p++] = 0; pmt[p++] = 0xF0; pmt[p++] = 0; pmt[p++] = video?.Codec == Codec.H265 ? (byte)0x24 : (byte)0x1B; pmt[p++] = 0xE1; pmt[p++] = 0; pmt[p++] = 0xF0; pmt[p++] = 0; pmt[p++] = 0x0F; pmt[p++] = 0xE1; pmt[p++] = 1; pmt[p++] = 0xF0; pmt[p++] = 0; WriteCrc(pmt, 5, p - 5);
+        var pat = new byte[188]; var pmt = new byte[188]; FillTs(pat, 0, true, ref pmtCc); var p = 4; pat[p++] = 0; pat[p++] = 0xB0; pat[p++] = 0x0D; pat[p++] = 0; pat[p++] = 1; pat[p++] = 0xC1; pat[p++] = 0; pat[p++] = 0; pat[p++] = 0; pat[p++] = 1; pat[p++] = 0xE0; pat[p++] = (byte)(PmtPid & 0xFF); pat[p++] = 0; WriteCrc(pat, 4, p); FillTs(pmt, PmtPid, true, ref pmtCc); p = 4; pmt[p++] = 0; pmt[p++] = 0xB0; pmt[p++] = 0x17; pmt[p++] = 0; pmt[p++] = 1; pmt[p++] = 0xC1; pmt[p++] = 0; pmt[p++] = 0x00; pmt[p++] = 0xE1; pmt[p++] = 0; pmt[p++] = 0xF0; pmt[p++] = 0; pmt[p++] = video?.Codec == Codec.H265 ? (byte)0x24 : (byte)0x1B; pmt[p++] = 0xE1; pmt[p++] = 0; pmt[p++] = 0xF0; pmt[p++] = 0; pmt[p++] = 0x0F; pmt[p++] = 0xE1; pmt[p++] = 1; pmt[p++] = 0xF0; pmt[p++] = 0; WriteCrc(pmt, 4, p);
         WriteRaw(pat); WriteRaw(pmt);
     }
 
