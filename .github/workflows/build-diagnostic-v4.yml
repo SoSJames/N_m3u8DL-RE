@@ -27,11 +27,6 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: Apply live resilience v4
-        run: |
-          python scripts/run-live-resilience-v4.py
-          python scripts/run-live-init-alias-patch.py
-
       - name: Install LLVM linker
         run: |
           sudo apt-get update
