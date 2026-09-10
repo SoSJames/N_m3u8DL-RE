@@ -39,12 +39,12 @@ jobs:
           p = Path('src/N_m3u8DL-RE/DownloadManager/SimpleLiveRecordManager2.cs')
           s = p.read_text(encoding='utf-8-sig')
           old = 'var observedPeriodId = streamSpec.Playlist?.PeriodId?.ToString() ?? "";'
-          new = 'var observedPeriodId = streamSpec.Playlist?.MediaInit?.Url ?? "";'
+          new = 'var observedPeriodId = streamSpec.PeriodId ?? "";'
           if old not in s:
               raise SystemExit('Expected PeriodId instrumentation anchor not found')
           s = s.replace(old, new, 1)
           old = 'time={seg.StartTime}'
-          new = 'time={seg.DateTime}'
+          new = 'timeVar={seg.NameFromVar} dateTime={seg.DateTime} duration={seg.Duration}'
           if old not in s:
               raise SystemExit('Expected StartTime instrumentation anchor not found')
           s = s.replace(old, new, 1)
