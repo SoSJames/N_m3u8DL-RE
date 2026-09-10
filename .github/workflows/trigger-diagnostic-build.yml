@@ -1,0 +1,16 @@
+name: Trigger Diagnostic Build
+
+on:
+  push:
+    branches:
+      - fix/live-dash-period-handoff
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger build
+        run: echo "Triggering diagnostic build for $GITHUB_SHA"
