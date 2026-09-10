@@ -312,7 +312,7 @@ internal sealed class NativeFmp4TsMuxer
                 }
                 if ((tfhdFlags & 0x000002) != 0)
                 {
-                    if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd track-id"); continue; }
+                    if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd sample-description-index"); continue; }
                     pos += 4;
                 }
                 if ((tfhdFlags & 0x000008) != 0)
@@ -345,10 +345,11 @@ internal sealed class NativeFmp4TsMuxer
                 pos2 += 4;
                 var moofBoxSize = 8L + moof.Length;
                 dataPos = (tfhdFlags & 0x020000) != 0
-                    ? dataOffset
+                    ? dataOffset - moofBoxSize
                     : baseDataOffset >= 0
                         ? baseDataOffset + dataOffset - moofBoxSize
                         : dataOffset - moofBoxSize;
+                Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dataOffset={dataOffset} moofBoxSize={moofBoxSize} resolvedDataPos={dataPos}");
             }
             else
             {
@@ -367,7 +368,15 @@ internal sealed class NativeFmp4TsMuxer
                 pos2 += 4;
             }
 
-            Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dts={dts} defDur={defDur} defSize={defSize} defFlags=0x{defFlags:X8} dataPos={dataPos} entryBytes={trunPayload.Length-pos2}");
+            var entryBytes = trunPayload.Length - pos2;
+            var compactDurationSize = (trunFlags & 0x000300) == 0 && sampleCount > 0 && entryBytes == sampleCount * 8u;
+            var compactDurationSizeCto = (trunFlags & 0x000300) == 0 && sampleCount > 0 && entryBytes == sampleCount * 12u;
+            if (compactDurationSize || compactDurationSizeCto)
+            {
+                Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: non-standard trun compatibility layout detected; perSampleBytes={entryBytes / sampleCount}; interpreting duration+size{(compactDurationSizeCto ? "+cto" : "")}");
+            }
+
+            Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dts={dts} defDur={defDur} defSize={defSize} defFlags=0x{defFlags:X8} dataPos={dataPos} entryBytes={entryBytes}");
 
             for (uint i = 0; i < sampleCount; i++)
             {
@@ -375,26 +384,42 @@ internal sealed class NativeFmp4TsMuxer
                 var size = defSize;
                 var sf = defFlags;
                 var cto = 0;
-                if ((trunFlags & 0x000100) != 0)
+
+                if (compactDurationSize || compactDurationSizeCto)
                 {
-                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing duration"); break; }
+                    if (pos2 + 8 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing compatibility duration/size"); break; }
                     dur = ReadU32(trunPayload, pos2); pos2 += 4;
-                }
-                if ((trunFlags & 0x000200) != 0)
-                {
-                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing size"); break; }
                     size = ReadU32(trunPayload, pos2); pos2 += 4;
+                    if (compactDurationSizeCto)
+                    {
+                        if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing compatibility CTO"); break; }
+                        cto = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4;
+                    }
                 }
-                if ((trunFlags & 0x000400) != 0)
+                else
                 {
-                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing flags"); break; }
-                    sf = ReadU32(trunPayload, pos2); pos2 += 4;
+                    if ((trunFlags & 0x000100) != 0)
+                    {
+                        if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing duration"); break; }
+                        dur = ReadU32(trunPayload, pos2); pos2 += 4;
+                    }
+                    if ((trunFlags & 0x000200) != 0)
+                    {
+                        if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing size"); break; }
+                        size = ReadU32(trunPayload, pos2); pos2 += 4;
+                    }
+                    if ((trunFlags & 0x000400) != 0)
+                    {
+                        if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing flags"); break; }
+                        sf = ReadU32(trunPayload, pos2); pos2 += 4;
+                    }
+                    if ((trunFlags & 0x000800) != 0)
+                    {
+                        if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing CTO"); break; }
+                        cto = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4;
+                    }
                 }
-                if ((trunFlags & 0x000800) != 0)
-                {
-                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing CTO"); break; }
-                    cto = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4;
-                }
+
                 if (size == 0) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} has zero size (flags=0x{trunFlags:X6}, trexSize={t.TrexDefaultSize})"); break; }
                 if (dataPos + size > mdat.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} exceeds mdat: pos={dataPos} size={size} mdat={mdat.Length}"); break; }
                 result.Add(new Sample(mdat.AsSpan(checked((int)dataPos), checked((int)size)).ToArray(), dts, cto, (sf & 0x10000) == 0));
