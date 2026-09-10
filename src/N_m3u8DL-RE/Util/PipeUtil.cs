@@ -22,42 +22,28 @@ internal static class PipeUtil
     {
         Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe called name={pipeName.EscapeMarkup()} thread={Environment.CurrentManagedThreadId}");
         Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe caller={new StackTrace(1, true).ToString().Replace(Environment.NewLine, " | ").EscapeMarkup()}");
-
-        // Capture scheduler state at entry. This is diagnostic only; do not alter
-        // ThreadPool settings here. If the second producer is being starved, this
-        // tells us whether the worker pool is actually exhausted.
-        try
-        {
-            ThreadPool.GetAvailableThreads(out var availableWorkers, out var availableIo);
-            ThreadPool.GetMaxThreads(out var maxWorkers, out var maxIo);
-            ThreadPool.GetMinThreads(out var minWorkers, out var minIo);
-            Logger.WarnMarkUp($"[PIPE-TRACE] ThreadPool entry workers={availableWorkers}/{maxWorkers} io={availableIo}/{maxIo} min={minWorkers}/{minIo}");
-        }
-        catch (Exception ex)
-        {
-            Logger.WarnMarkUp($"[PIPE-TRACE] ThreadPool diagnostics failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}");
-        }
-
+        ThreadPool.GetAvailableThreads(out var availableWorkers, out var availableIo);
+        ThreadPool.GetMaxThreads(out var maxWorkers, out var maxIo);
+        ThreadPool.GetMinThreads(out var minWorkers, out var minIo);
+        Logger.WarnMarkUp($"[PIPE-TRACE] ThreadPool entry workers={availableWorkers}/{maxWorkers} io={availableIo}/{maxIo} min={minWorkers}/{minIo}");
         Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before OS check");
-        var isWindows = OperatingSystem.IsWindows();
-        Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: OS check complete windows={isWindows}");
 
-        if (isWindows)
+        if (OperatingSystem.IsWindows())
         {
+            Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: OS check complete windows=True");
             Logger.InfoMarkUp($"[yellow]PIPE create (Windows): {pipeName.EscapeMarkup()}[/]");
             var stream = new NamedPipeServerStream(pipeName, PipeDirection.InOut);
             Logger.InfoMarkUp($"[yellow]PIPE Windows stream opened: {pipeName.EscapeMarkup()}[/]");
             return stream;
         }
 
+        Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: OS check complete windows=False");
         Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before Path.GetTempPath");
         var tempPath = Path.GetTempPath();
         Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: Path.GetTempPath complete path={tempPath.EscapeMarkup()}");
-
         Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before Path.Combine");
         var path = Path.Combine(tempPath, pipeName);
         Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: Path.Combine complete path={path.EscapeMarkup()}");
-
         Logger.InfoMarkUp($"[yellow]PIPE create (FIFO) begin: {path.EscapeMarkup()}[/]");
 
         try
@@ -65,7 +51,6 @@ internal static class PipeUtil
             Logger.WarnMarkUp("[PIPE-TRACE] CreatePipe checkpoint: before File.Exists");
             var exists = File.Exists(path);
             Logger.WarnMarkUp($"[PIPE-TRACE] CreatePipe checkpoint: File.Exists complete exists={exists}");
-
             if (exists)
             {
                 Logger.WarnMarkUp($"[PIPE-TRACE] FIFO path already exists; removing stale path: {path.EscapeMarkup()}");
@@ -146,31 +131,36 @@ internal static class PipeUtil
         var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(streamOutput))
         {
-            return NativeMuxTasks.GetOrAdd(streamOutput, key => Task.Run(async () =>
+            var task = NativeMuxTasks.GetOrAdd(streamOutput, key =>
             {
-                try
+                Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task queueing on dedicated thread.[/]");
+                return Task.Factory.StartNew(async () =>
                 {
-                    Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
-                    Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
-                    Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
+                    try
+                    {
+                        Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
+                        Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
+                        Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
 
-                    // Both producer FIFOs have already been created/opened read/write.
-                    // Attach the native muxer directly; no producer-side readiness
-                    // handshake is required.
-                    var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput);
-                    Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
-                    return result;
-                }
-                catch (Exception ex)
-                {
-                    Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
-                    return false;
-                }
-                finally
-                {
-                    NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
-                }
-            }));
+                        // The native muxer is a long-lived I/O pipeline. Run its initial
+                        // FIFO attachment on a dedicated thread so it cannot be delayed
+                        // behind producer/download work on the managed ThreadPool.
+                        var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput).ConfigureAwait(false);
+                        Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
+                        return result;
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
+                        return false;
+                    }
+                    finally
+                    {
+                        NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
+                    }
+                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            });
+            return task;
         }
 
         return Task.Run(() =>
