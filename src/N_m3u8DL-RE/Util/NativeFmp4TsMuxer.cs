@@ -14,7 +14,9 @@ internal sealed class NativeFmp4TsMuxer
     private int videoCc, audioCc, pmtCc;
     private Track? video, audio;
     private bool psiWritten;
+    private bool emitWaitLogged;
     private long videoSamples, audioSamples, videoBytes, audioBytes, moofCount;
+    private long tsPacketsWritten, tsBytesWritten, pesWrites;
 
     private NativeFmp4TsMuxer(Stream output) => this.output = output;
 
@@ -36,7 +38,7 @@ internal sealed class NativeFmp4TsMuxer
             var mux = new NativeFmp4TsMuxer(dst);
             await Task.WhenAll(mux.ReadPipeAsync(p0, 0), mux.ReadPipeAsync(p1, 1));
             await dst.FlushAsync();
-            Logger.InfoMarkUp($"[deepskyblue1]Native mux complete: moof={mux.moofCount}; videoSamples={mux.videoSamples}; audioSamples={mux.audioSamples}; videoBytes={mux.videoBytes}; audioBytes={mux.audioBytes}; psi={mux.psiWritten}[/]");
+            Logger.InfoMarkUp($"[deepskyblue1]Native mux complete: moof={mux.moofCount}; videoSamples={mux.videoSamples}; audioSamples={mux.audioSamples}; videoBytes={mux.videoBytes}; audioBytes={mux.audioBytes}; pesWrites={mux.pesWrites}; tsPackets={mux.tsPacketsWritten}; tsBytes={mux.tsBytesWritten}; psi={mux.psiWritten}[/]");
             return mux.psiWritten;
         }
         catch (Exception ex) { Logger.ErrorMarkUp($"[red]Native fMP4 mux failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]"); return false; }
@@ -86,13 +88,41 @@ internal sealed class NativeFmp4TsMuxer
 
     private async Task EmitAsync(Track t, Sample s)
     {
-        while (video == null || audio == null) await Task.Delay(5);
+        if (video == null || audio == null)
+        {
+            if (!emitWaitLogged)
+            {
+                emitWaitLogged = true;
+                Logger.WarnMarkUp($"[PIPE-TS] Emit waiting for both tracks: current={(t.Kind == Kind.Video ? "video" : "audio")}; videoInit={(video != null)}; audioInit={(audio != null)}; sampleBytes={s.Data.Length}");
+            }
+            while (video == null || audio == null) await Task.Delay(5);
+            Logger.WarnMarkUp("[PIPE-TS] Emit wait released: both video and audio init tracks are available.");
+        }
+
         lock (gate)
         {
-            if (!psiWritten) { WritePsi(); psiWritten = true; Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/]"); }
-            var pts = Scale90((long)s.Dts + s.Cto, t.TimeScale); var dts = Scale90((long)s.Dts, t.TimeScale);
-            if (t.Kind == Kind.Video) { var payload = ConvertVideo(s.Data, t); videoSamples++; videoBytes += payload.Length; WritePes(payload, VideoPid, pts, dts, true, ref videoCc); }
-            else { var payload = AddAdts(s.Data, t); audioSamples++; audioBytes += payload.Length; WritePes(payload, AudioPid, pts, pts, false, ref audioCc); }
+            if (!psiWritten)
+            {
+                Logger.WarnMarkUp($"[PIPE-TS] Writing PAT/PMT before first PES: videoCodec={video!.Codec}; videoPid=0x{VideoPid:X}; audioPid=0x{AudioPid:X}; pmtPid=0x{PmtPid:X}");
+                WritePsi();
+                psiWritten = true;
+                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/]");
+            }
+
+            var pts = Scale90((long)s.Dts + s.Cto, t.TimeScale);
+            var dts = Scale90((long)s.Dts, t.TimeScale);
+            if (t.Kind == Kind.Video)
+            {
+                var payload = ConvertVideo(s.Data, t);
+                videoSamples++; videoBytes += payload.Length;
+                WritePes(payload, VideoPid, pts, dts, true, ref videoCc);
+            }
+            else
+            {
+                var payload = AddAdts(s.Data, t);
+                audioSamples++; audioBytes += payload.Length;
+                WritePes(payload, AudioPid, pts, pts, false, ref audioCc);
+            }
         }
         await Task.CompletedTask;
     }
@@ -196,18 +226,14 @@ internal sealed class NativeFmp4TsMuxer
             var compactDurationSizeCto = (trunFlags & 0x000300) == 0 && sampleCount > 0 && entryBytes == sampleCount * 12u;
             var compactDurationSizeCtoTrailing = (trunFlags & 0x000300) == 0 && sampleCount > 0 && entryBytes == sampleCount * 12u + 4u;
             var compatibilityCtoBytes = compactDurationSizeCto || compactDurationSizeCtoTrailing;
-            if (compactDurationSize || compatibilityCtoBytes)
+            if (compactDurationSize)
+                Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: non-standard trun compatibility layout detected; perSampleBytes=8; interpreting duration+size");
+            else if (compatibilityCtoBytes)
             {
                 var extra = compactDurationSizeCtoTrailing ? 4 : 0;
                 Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: non-standard trun compatibility layout detected; perSampleBytes={(entryBytes - extra) / sampleCount}; interpreting duration+size+cto{(extra > 0 ? $"; trailingBytes={extra}" : "")}");
-                if (extra > 0)
-                {
-                    var tail = ReadU32(trunPayload, trunPayload.Length - 4);
-                    Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: compatibility trailing field=0x{tail:X8}");
-                }
+                if (extra > 0) Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: compatibility trailing field=0x{ReadU32(trunPayload, trunPayload.Length - 4):X8}");
             }
-            else if (compactDurationSize)
-                Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: non-standard trun compatibility layout detected; perSampleBytes=8; interpreting duration+size");
 
             Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dts={dts} defDur={defDur} defSize={defSize} defFlags=0x{defFlags:X8} dataPos={dataPos} entryBytes={entryBytes}");
             var sampleRecordEnd = compactDurationSizeCtoTrailing ? trunPayload.Length - 4 : trunPayload.Length;
@@ -246,14 +272,18 @@ internal sealed class NativeFmp4TsMuxer
         var ps = new byte[] { 0, 0xB0, 0x0D, 0, 1, 0xC1, 0, 0, 0, 1, 0xF0, 0, 0, 0, 0, 0 }; Crc(ps, 0, 12); Buffer.BlockCopy(ps, 0, pat, 5, 16); output.Write(pat);
         var pmt = new byte[188]; Array.Fill(pmt, (byte)0xFF); Header(pmt, PmtPid, true, ref pmtCc); pmt[4] = 0;
         var body = new byte[26]; body[0]=2; body[1]=0xB0; body[2]=0x17; body[3]=0; body[4]=1; body[5]=0xC1; body[6]=0; body[7]=0; body[8]=0xE1; body[9]=0; body[10]=0xF0; body[11]=0; body[12]=(byte)(video!.Codec==Codec.H265?0x24:0x1B); body[13]=0xE1; body[14]=0; body[15]=0xF0; body[16]=0; body[17]=0x0F; body[18]=0xE1; body[19]=1; body[20]=0xF0; body[21]=0; Crc(body,0,22); Buffer.BlockCopy(body,0,pmt,5,26); output.Write(pmt);
+        Logger.WarnMarkUp("[PIPE-TS] WritePsi wrote PAT=188 bytes and PMT=188 bytes; totalTsBytes=376");
+        tsPacketsWritten += 2; tsBytesWritten += 376;
     }
 
     private void WritePes(byte[] payload, int pid, long pts, long dts, bool videoPes, ref int cc)
     {
         var h = new byte[dts == pts ? 14 : 19]; h[0]=0; h[1]=0; h[2]=1; h[3]=(byte)(videoPes?0xE0:0xC0); h[6]=(byte)(dts==pts?0x80:0xC0); h[7]=(byte)(dts==pts?5:10); WritePts(h.AsSpan(8), dts==pts?0x20:0x30, pts); if(dts!=pts) WritePts(h.AsSpan(13),0x10,dts);
         var pesLen = payload.Length + h.Length - 6; BinaryPrimitives.WriteUInt16BigEndian(h.AsSpan(4,2), pesLen <= 0xFFFF ? (ushort)pesLen : (ushort)0);
-        var src = new byte[h.Length+payload.Length]; Buffer.BlockCopy(h,0,src,0,h.Length); Buffer.BlockCopy(payload,0,src,h.Length,payload.Length); var off=0; var first=true;
-        while(off<src.Length) { var ts=new byte[188]; Array.Fill(ts,(byte)0xFF); ts[0]=0x47; ts[1]=(byte)(((pid>>8)&0x1F)|(first?0x40:0)); ts[2]=(byte)pid; var n=Math.Min(184,src.Length-off); var useAdapt=n<184; ts[3]=(byte)((useAdapt?0x30:0x10)|(cc++&15)); var p=4; if(useAdapt){var stuffing=182-n;ts[4]=(byte)(183-n);ts[5]=0;p=6+stuffing;} Buffer.BlockCopy(src,off,ts,p,n); off+=n; output.Write(ts); first=false; }
+        var src = new byte[h.Length+payload.Length]; Buffer.BlockCopy(h,0,src,0,h.Length); Buffer.BlockCopy(payload,0,src,h.Length,payload.Length); var off=0; var first=true; var packetCount=0; var byteCount=0;
+        while(off<src.Length) { var ts=new byte[188]; Array.Fill(ts,(byte)0xFF); ts[0]=0x47; ts[1]=(byte)(((pid>>8)&0x1F)|(first?0x40:0)); ts[2]=(byte)pid; var n=Math.Min(184,src.Length-off); var useAdapt=n<184; ts[3]=(byte)((useAdapt?0x30:0x10)|(cc++&15)); var p=4; if(useAdapt){var stuffing=182-n;ts[4]=(byte)(183-n);ts[5]=0;p=6+stuffing;} Buffer.BlockCopy(src,off,ts,p,n); off+=n; output.Write(ts); first=false; packetCount++; byteCount+=188; }
+        pesWrites++; tsPacketsWritten += packetCount; tsBytesWritten += byteCount;
+        if (pesWrites <= 5 || pesWrites % 100 == 0) Logger.WarnMarkUp($"[PIPE-TS] PES write #{pesWrites}: kind={(videoPes ? "video" : "audio")} pid=0x{pid:X} payload={payload.Length} pesBytes={src.Length} packets={packetCount} bytes={byteCount} pts={pts} dts={dts} cumulativeTsBytes={tsBytesWritten}");
     }
 
     private static byte[] ConvertVideo(byte[] data, Track t){using var ms=new MemoryStream(data.Length+32);var p=0;while(p+t.NalLengthSize<=data.Length){var n=t.NalLengthSize switch{1=>data[p],2=>BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p,2)),3=>(data[p]<<16)|(data[p+1]<<8)|data[p+2],_=>checked((int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p,4)))};p+=t.NalLengthSize;if(n<=0||p+n>data.Length)break;ms.Write(new byte[]{0,0,0,1});ms.Write(data,p,n);p+=n;}return ms.ToArray();}
