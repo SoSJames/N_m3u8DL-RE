@@ -156,6 +156,9 @@ internal class SimpleLiveRecordManager2
         var readInfo = false; // 是否读取过
         bool useAACFilter = false; // ffmpeg合并flag
         bool initDownloaded = false; // 是否下载过init文件
+        string activePeriodId = "";
+        string activeInitUrl = "";
+        int periodTransitionSegmentsLogged = 0;
         ConcurrentDictionary<MediaSegment, DownloadResult?> FileDic = new();
         List<Mediainfo> mediaInfos = [];
         Stream? fileOutputStream = null;
@@ -199,6 +202,24 @@ internal class SimpleLiveRecordManager2
             var segmentsDuration = segments.Sum(s => s.Duration);
             Logger.DebugMarkUp(string.Join(",", segments.Select(sss => GetSegmentName(sss, false, false))));
 
+            // Diagnose live DASH Period/init handoff without changing recording behavior.
+            var observedPeriodId = streamSpec.Playlist?.PeriodId?.ToString() ?? "";
+            var observedInitUrl = streamSpec.Playlist?.MediaInit?.Url ?? "";
+            var observedKid = streamSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";
+            var periodChanged = !string.IsNullOrEmpty(activePeriodId) &&
+                                (observedPeriodId != activePeriodId || observedInitUrl != activeInitUrl);
+            if (periodChanged)
+            {
+                periodTransitionSegmentsLogged = 0;
+                Logger.WarnMarkUp($"[DASH-HANDOFF] PERIOD CHANGE stream={task.Id} oldPeriod={activePeriodId} newPeriod={observedPeriodId} oldInit={activeInitUrl} newInit={observedInitUrl} newKID={observedKid}");
+            }
+            else if (string.IsNullOrEmpty(activePeriodId) && (!string.IsNullOrEmpty(observedPeriodId) || !string.IsNullOrEmpty(observedInitUrl)))
+            {
+                Logger.WarnMarkUp($"[DASH-HANDOFF] INITIAL PERIOD stream={task.Id} period={observedPeriodId} init={observedInitUrl} KID={observedKid}");
+            }
+            activePeriodId = observedPeriodId;
+            activeInitUrl = observedInitUrl;
+
             // 下载init
             if (!initDownloaded && streamSpec.Playlist?.MediaInit != null) 
             {
@@ -211,7 +232,9 @@ internal class SimpleLiveRecordManager2
                 }
 
                 var path = Path.Combine(tmpDir, "_init.mp4.tmp");
+                Logger.WarnMarkUp($"[DASH-HANDOFF] INIT DOWNLOAD stream={task.Id} period={activePeriodId} url={streamSpec.Playlist.MediaInit.Url} mpdKID={streamSpec.Playlist.MediaInit.EncryptInfo.KID}");
                 var result = await Downloader.DownloadSegmentAsync(streamSpec.Playlist.MediaInit, path, speedContainer, headers);
+                Logger.WarnMarkUp($"[DASH-HANDOFF] INIT RESULT stream={task.Id} success={result?.Success} actual={result?.ActualFilePath}");
                 FileDic[streamSpec.Playlist.MediaInit] = result;
                 if (result is not { Success: true })
                 {
@@ -238,6 +261,7 @@ internal class SimpleLiveRecordManager2
                         var enc = result.ActualFilePath;
                         var dec = Path.Combine(Path.GetDirectoryName(enc)!, Path.GetFileNameWithoutExtension(enc) + "_dec" + Path.GetExtension(enc));
                         var dResult = await MP4DecryptUtil.DecryptAsync(decryptEngine, decryptionBinaryPath, DownloaderConfig.MyOptions.Keys, enc, dec, currentKID);
+                        Logger.WarnMarkUp($"[DASH-HANDOFF] INIT DECRYPT stream={task.Id} period={activePeriodId} KID={currentKID} success={dResult} enc={enc} dec={dec}");
                         if (dResult)
                         {
                             FileDic[streamSpec.Playlist.MediaInit]!.ActualFilePath = dec;
@@ -361,6 +385,11 @@ internal class SimpleLiveRecordManager2
                 var path = Path.Combine(tmpDir, filename + $".{streamSpec.Extension ?? "clip"}.tmp");
                 var result = await Downloader.DownloadSegmentAsync(seg, path, speedContainer, headers);
                 FileDic[seg] = result;
+                var traceSegmentNo = Interlocked.Increment(ref periodTransitionSegmentsLogged);
+                if (traceSegmentNo <= 8)
+                {
+                    Logger.WarnMarkUp($"[DASH-HANDOFF] SEGMENT RESULT stream={task.Id} traceNo={traceSegmentNo} period={activePeriodId} index={seg.Index} time={seg.StartTime} encrypted={seg.IsEncrypted} success={result?.Success} url={seg.Url} actual={result?.ActualFilePath}");
+                }
                 if (result is { Success: true })
                     task.Increment(1);
                 // 实时解密
@@ -369,6 +398,10 @@ internal class SimpleLiveRecordManager2
                     var enc = result.ActualFilePath;
                     var dec = Path.Combine(Path.GetDirectoryName(enc)!, Path.GetFileNameWithoutExtension(enc) + "_dec" + Path.GetExtension(enc));
                     var dResult = await MP4DecryptUtil.DecryptAsync(decryptEngine, decryptionBinaryPath, DownloaderConfig.MyOptions.Keys, enc, dec, currentKID, mp4InitFile);
+                    if (traceSegmentNo <= 8)
+                    {
+                        Logger.WarnMarkUp($"[DASH-HANDOFF] SEGMENT DECRYPT stream={task.Id} traceNo={traceSegmentNo} period={activePeriodId} index={seg.Index} KID={currentKID} init={mp4InitFile} success={dResult} enc={enc} dec={dec}");
+                    }
                     if (dResult)
                     {
                         File.Delete(enc);
