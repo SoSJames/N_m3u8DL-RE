@@ -260,8 +260,8 @@ internal sealed class NativeFmp4TsMuxer
     private static void Crc(byte[] b,int start,int len){uint c=0xFFFFFFFF;for(int i=start;i<start+len;i++){c^=(uint)b[i]<<24;for(int j=0;j<8;j++)c=(c&0x80000000)!=0?(c<<1)^0x04C11DB7:c<<1;}BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(start+len,4),c);}
     private static int ReadU24(byte[]p,int i)=>(p[i]<<16)|(p[i+1]<<8)|p[i+2]; private static uint ReadU32(byte[]p,int i)=>BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(i,4));
     private static int Frequency(int i)=>i switch{0=>96000,1=>88200,2=>64000,3=>48000,4=>44100,5=>32000,6=>24000,7=>22050,8=>16000,9=>12000,10=>11025,11=>8000,12=>7350,_=>48000};
-    private static byte[]? FindDescriptor(byte[]d,byte tag){for(int i=0;i<d.Length-2;i++)if(d[i]==tag){int p=i+1,n=0;for(int j=0;j<4&&p<d.Length;j++){var q=d[p++];n=(n<<7)|(q&0x7F);if((q&0x80)==0)return p+n<=d.Length?d[p..(p+n)]:null;}}return null;}
-    private static Box? FindBox(byte[]d,string t)=>FindBoxes(d,t).FirstOrDefault();
+    private static byte[]? FindDescriptor(byte[]d,byte tag){if(d==null)return null;for(int i=0;i<d.Length-2;i++)if(d[i]==tag){int p=i+1,n=0;for(int j=0;j<4&&p<d.Length;j++){var q=d[p++];n=(n<<7)|(q&0x7F);if((q&0x80)==0)return p+n<=d.Length?d[p..(p+n)]:null;}}return null;}
+    private static Box? FindBox(byte[]d,string t){foreach(var b in FindBoxes(d,t))return b;return null;}
     private static IEnumerable<Box> FindBoxes(byte[]d,string t){foreach(var b in Boxes(d)){if(b.Type==t)yield return b;foreach(var c in FindBoxes(b.Payload,t))yield return c;}}
     private static IEnumerable<Box> Boxes(byte[]d){int p=0;while(p+8<=d.Length){long s=BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(p,4));var t=Encoding.ASCII.GetString(d,p+4,4);int h=8;if(s==1&&p+16<=d.Length){s=(long)BinaryPrimitives.ReadUInt64BigEndian(d.AsSpan(p+8,8));h=16;}if(s<h||p+s>d.Length)yield break;yield return new Box(t,d.AsSpan(p+h,checked((int)s-h)).ToArray());p+=checked((int)s);}}
     private readonly record struct Box(string Type,byte[] Payload); private readonly record struct Sample(byte[]Data,ulong Dts,int Cto,bool Sync);
