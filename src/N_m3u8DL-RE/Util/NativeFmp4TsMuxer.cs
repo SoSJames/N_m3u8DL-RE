@@ -128,7 +128,7 @@ internal sealed class NativeFmp4TsMuxer
             {
                 WritePsi();
                 psiWritten = true;
-                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/");
+                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/]");
             }
             var pts = Scale90((long)s.Dts + s.Cto, t.TimeScale);
             var dts = Scale90((long)s.Dts, t.TimeScale);
@@ -162,6 +162,14 @@ internal sealed class NativeFmp4TsMuxer
             if (t.Kind == Kind.Unknown) continue;
 
             Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} track handler={handler}");
+
+            var tkhd = FindBox(trak.Payload, "tkhd");
+            if (tkhd != null)
+            {
+                var p = tkhd.Value.Payload;
+                if (p.Length >= 20 && p[0] == 0) t.TrackId = ReadU32(p, 12);
+                else if (p.Length >= 32 && p[0] == 1) t.TrackId = ReadU32(p, 20);
+            }
 
             var mdhd = FindBox(trak.Payload, "mdhd");
             if (mdhd != null)
@@ -200,6 +208,21 @@ internal sealed class NativeFmp4TsMuxer
                 t.SampleRate = Frequency(t.AacFreq);
                 t.Channels = (a1 >> 3) & 15; if (t.Channels == 0) t.Channels = 2;
             }
+
+            foreach (var trex in FindBoxes(moov, "trex"))
+            {
+                var p = trex.Payload;
+                if (p.Length < 24) continue;
+                var trackId = ReadU32(p, 4);
+                if (trackId != t.TrackId) continue;
+                t.DefaultSampleDescriptionIndex = ReadU32(p, 8);
+                t.TrexDefaultDuration = ReadU32(p, 12);
+                t.TrexDefaultSize = ReadU32(p, 16);
+                t.TrexDefaultFlags = ReadU32(p, 20);
+                Logger.WarnMarkUp($"[PIPE-DIAG] reader={pipeIndex} trex track={trackId} defDur={t.TrexDefaultDuration} defSize={t.TrexDefaultSize} defFlags=0x{t.TrexDefaultFlags:X8}");
+                break;
+            }
+
             return t;
         }
         throw new InvalidDataException("No supported track in moov");
@@ -268,11 +291,15 @@ internal sealed class NativeFmp4TsMuxer
 
             ulong dts = 0;
             if (tfdt != null && tfdt.Value.Payload.Length >= 8)
-                dts = tfdt.Value.Payload[0] == 1 && tfdt.Value.Payload.Length >= 12
-                    ? BinaryPrimitives.ReadUInt64BigEndian(tfdt.Value.Payload.AsSpan(4, 8))
-                    : BinaryPrimitives.ReadUInt32BigEndian(tfdt.Value.Payload.AsSpan(4, 4));
+            {
+                var p = tfdt.Value.Payload;
+                if (p[0] == 1 && p.Length >= 12)
+                    dts = BinaryPrimitives.ReadUInt64BigEndian(p.AsSpan(4, 8));
+                else
+                    dts = BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(4, 4));
+            }
 
-            uint defDur = 0, defSize = 0;
+            uint defDur = 0, defSize = 0, defFlags = 0;
             long baseDataOffset = -1;
             if (tfhdPayload != null && tfhdPayload.Length >= 8)
             {
@@ -283,7 +310,11 @@ internal sealed class NativeFmp4TsMuxer
                     baseDataOffset = unchecked((long)BinaryPrimitives.ReadUInt64BigEndian(tfhdPayload.AsSpan(pos, 8)));
                     pos += 8;
                 }
-                if ((tfhdFlags & 0x000002) != 0) pos += 4;
+                if ((tfhdFlags & 0x000002) != 0)
+                {
+                    if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd track-id"); continue; }
+                    pos += 4;
+                }
                 if ((tfhdFlags & 0x000008) != 0)
                 {
                     if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd default-duration"); continue; }
@@ -292,29 +323,43 @@ internal sealed class NativeFmp4TsMuxer
                 if ((tfhdFlags & 0x000010) != 0)
                 {
                     if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd default-size"); continue; }
-                    defSize = ReadU32(tfhdPayload, pos);
+                    defSize = ReadU32(tfhdPayload, pos); pos += 4;
+                }
+                if ((tfhdFlags & 0x000020) != 0)
+                {
+                    if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd default-flags"); continue; }
+                    defFlags = ReadU32(tfhdPayload, pos);
                 }
             }
 
+            if (defDur == 0) defDur = t.TrexDefaultDuration;
+            if (defSize == 0) defSize = t.TrexDefaultSize;
+            if (defFlags == 0) defFlags = t.TrexDefaultFlags;
+
             var pos2 = 8;
-            long dataPos = 0;
+            long dataPos;
             if ((trunFlags & 0x000001) != 0)
             {
                 if (pos2 + 4 > trunPayload.Length) continue;
                 var dataOffset = unchecked((int)ReadU32(trunPayload, pos2));
                 pos2 += 4;
                 var moofBoxSize = 8L + moof.Length;
-                dataPos = (long)dataOffset - moofBoxSize;
-                if (baseDataOffset >= 0)
-                    dataPos = baseDataOffset + dataOffset - moofBoxSize;
+                dataPos = (tfhdFlags & 0x020000) != 0
+                    ? dataOffset
+                    : baseDataOffset >= 0
+                        ? baseDataOffset + dataOffset - moofBoxSize
+                        : dataOffset - moofBoxSize;
             }
-            else if (baseDataOffset >= 0)
+            else
             {
-                var moofBoxStart = baseDataOffset;
-                var currentMdatStart = moofBoxStart + 8L + moof.Length;
-                dataPos = currentMdatStart - moofBoxStart;
+                dataPos = (tfhdFlags & 0x020000) != 0 || baseDataOffset < 0 ? 0 : baseDataOffset - (8L + moof.Length);
             }
-            if (dataPos < 0 || dataPos > mdat.Length) dataPos = 0;
+
+            if (dataPos < 0 || dataPos > mdat.Length)
+            {
+                Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dataPos out of range: {dataPos}, forcing 0");
+                dataPos = 0;
+            }
 
             if ((trunFlags & 0x000004) != 0)
             {
@@ -322,13 +367,13 @@ internal sealed class NativeFmp4TsMuxer
                 pos2 += 4;
             }
 
-            Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dts={dts} defDur={defDur} defSize={defSize} dataPos={dataPos} entryBytes={trunPayload.Length-pos2}");
+            Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dts={dts} defDur={defDur} defSize={defSize} defFlags=0x{defFlags:X8} dataPos={dataPos} entryBytes={trunPayload.Length-pos2}");
 
             for (uint i = 0; i < sampleCount; i++)
             {
                 var dur = defDur;
                 var size = defSize;
-                var sf = 0u;
+                var sf = defFlags;
                 var cto = 0;
                 if ((trunFlags & 0x000100) != 0)
                 {
@@ -350,7 +395,7 @@ internal sealed class NativeFmp4TsMuxer
                     if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing CTO"); break; }
                     cto = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4;
                 }
-                if (size == 0) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} has zero size (flags=0x{trunFlags:X6})"); break; }
+                if (size == 0) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} has zero size (flags=0x{trunFlags:X6}, trexSize={t.TrexDefaultSize})"); break; }
                 if (dataPos + size > mdat.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} exceeds mdat: pos={dataPos} size={size} mdat={mdat.Length}"); break; }
                 result.Add(new Sample(mdat.AsSpan(checked((int)dataPos), checked((int)size)).ToArray(), dts, cto, (sf & 0x10000) == 0));
                 dts += dur;
@@ -402,6 +447,6 @@ internal sealed class NativeFmp4TsMuxer
     private static IEnumerable<Box> Boxes(byte[]d){int p=0;while(p+8<=d.Length){long s=BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(p,4));var t=Encoding.ASCII.GetString(d,p+4,4);int h=8;if(s==1&&p+16<=d.Length){s=(long)BinaryPrimitives.ReadUInt64BigEndian(d.AsSpan(p+8,8));h=16;}if(s<h||p+s>d.Length)yield break;yield return new Box(t,d.AsSpan(p+h,checked((int)s-h)).ToArray());p+=checked((int)s);}}
     private readonly record struct Box(string Type,byte[] Payload); private readonly record struct Sample(byte[]Data,ulong Dts,int Cto,bool Sync);
     private enum Kind{Unknown,Video,Audio} private enum Codec{H264,H265}
-    private sealed class Track{public Kind Kind;public Codec Codec;public uint TimeScale;public int NalLengthSize=4;public byte[]? Asc;public int AacProfile=2,AacFreq=4,SampleRate=44100,Channels=2;}
+    private sealed class Track{public Kind Kind;public Codec Codec;public uint TimeScale;public int NalLengthSize=4;public byte[]? Asc;public int AacProfile=2,AacFreq=4,SampleRate=44100,Channels=2;public uint TrackId;public uint DefaultSampleDescriptionIndex;public uint TrexDefaultDuration,TrexDefaultSize,TrexDefaultFlags;}
     private sealed class BoxReader{private readonly Stream s;public BoxReader(Stream s)=>this.s=s;public async Task<Box?> ReadAsync(){var h=new byte[8];var n=await ReadExact(h);if(n==0)return null;if(n<8)throw new EndOfStreamException();long z=BinaryPrimitives.ReadUInt32BigEndian(h.AsSpan(0,4));var t=Encoding.ASCII.GetString(h,4,4);int hs=8;if(z==1){var x=new byte[8];if(await ReadExact(x)!=8)throw new EndOfStreamException();z=(long)BinaryPrimitives.ReadUInt64BigEndian(x);hs=16;}if(z<hs||z>int.MaxValue)throw new InvalidDataException();var p=new byte[(int)z-hs];if(await ReadExact(p)!=p.Length)throw new EndOfStreamException();return new Box(t,p);}private async Task<int>ReadExact(byte[]b){int n=0;while(n<b.Length){var k=await s.ReadAsync(b.AsMemory(n));if(k==0)break;n+=k;}return n;}}
 }
