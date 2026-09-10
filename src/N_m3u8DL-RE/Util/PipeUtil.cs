@@ -1,4 +1,4 @@
-﻿using N_m3u8DL_RE.Common.Log;
+using N_m3u8DL_RE.Common.Log;
 using Spectre.Console;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -119,38 +119,40 @@ internal static class PipeUtil
         {
             var task = NativeMuxTasks.GetOrAdd(streamOutput, key =>
             {
-                Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task queueing on dedicated thread.[/]");
-                // Keep the LongRunning delegate synchronous. The previous async lambda
-                // + Unwrap construction never reached its first log in the live test.
-                // A synchronous delegate makes entry onto the dedicated thread explicit,
-                // then blocks that dedicated thread while the native async I/O pipeline runs.
-                return Task.Factory.StartNew(
-                    () =>
+                Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task queueing on explicit thread.[/]");
+                var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var thread = new Thread(() =>
+                {
+                    try
                     {
-                        try
-                        {
-                            Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
-                            Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
-                            Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
-                            var result = NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput)
-                                .GetAwaiter()
-                                .GetResult();
-                            Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
-                            return result;
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
-                            return false;
-                        }
-                        finally
-                        {
-                            NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
-                        }
-                    },
-                    CancellationToken.None,
-                    TaskCreationOptions.LongRunning,
-                    TaskScheduler.Default);
+                        Logger.InfoMarkUp($"[deepskyblue1]FFmpeg-free native MPEG-TS pipe output:[/] {streamOutput.EscapeMarkup()}");
+                        Logger.InfoMarkUp("[deepskyblue1]PIPE native mux thread started.[/]");
+                        Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
+                        var result = NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput)
+                            .GetAwaiter()
+                            .GetResult();
+                        Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
+                        completion.TrySetResult(result);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
+                        completion.TrySetResult(false);
+                    }
+                    finally
+                    {
+                        NativePipeRegistries.TryRemove(key, out ConcurrentDictionary<string, byte>? removedRegistry);
+                    }
+                })
+                {
+                    IsBackground = true,
+                    Name = $"N_m3u8DL-RE NativeMux {Path.GetFileName(streamOutput)}"
+                };
+
+                Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux starting explicit thread: {thread.Name}[/]");
+                thread.Start();
+                Logger.InfoMarkUp("[deepskyblue1]PIPE native mux explicit thread Start() returned.[/]");
+                return completion.Task;
             });
             return task;
         }
