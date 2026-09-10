@@ -14,7 +14,6 @@ internal static class PipeUtil
     private const string StreamPipeOutputEnvironmentVariable = "N_M3U8_STREAM_PIPE_OUTPUT";
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> NativePipeRegistries = new();
     private static readonly ConcurrentDictionary<string, Task<bool>> NativeMuxTasks = new();
-    private static readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> NativeMuxReady = new();
 
     [DllImport("libc", SetLastError = true)]
     private static extern int mkfifo(string pathname, uint mode);
@@ -53,21 +52,19 @@ internal static class PipeUtil
             var attributes = File.GetAttributes(path);
             Logger.InfoMarkUp($"[yellow]PIPE FIFO exists/type={attributes}; opening read/write[/]");
 
-            // Open an existing FIFO. ReadWrite prevents the open from waiting for a
-            // separate reader/writer, while FileMode.Open avoids silently replacing
-            // a FIFO with an ordinary file.
+            // Open an existing FIFO read/write. This avoids waiting for a separate
+            // reader/writer and keeps CreatePipe non-blocking while the native muxer
+            // attaches to the FIFO asynchronously.
             var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
             Logger.InfoMarkUp($"[yellow]PIPE opened: {path.EscapeMarkup()}[/]");
 
             RegisterNativePipeAndMaybeStartMux(pipeName);
 
-            // Do not synchronously wait here. CreatePipe is called from the parallel
-            // stream workers; blocking the first worker here can starve the worker that
-            // needs to create the second A/V FIFO. The returned stream gates its first
-            // write on native mux readiness instead, allowing both FIFOs to be created.
-            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable)))
-                return new NativeMuxReadyStream(stream);
-
+            // IMPORTANT: return immediately. The producer must never wait for the
+            // native muxer here (or on its first write), because CreatePipe/CopyTo
+            // runs in the parallel stream workers. Native mux startup is triggered
+            // once both FIFOs are registered, and FIFO backpressure is allowed to
+            // regulate the producers naturally.
             return stream;
         }
         catch (Exception ex)
@@ -75,82 +72,6 @@ internal static class PipeUtil
             Logger.ErrorMarkUp($"[PIPE-TRACE] CreatePipe FAILED path={path.EscapeMarkup()} type={ex.GetType().Name} message={ex.Message.EscapeMarkup()}");
             throw;
         }
-    }
-
-    private static bool WaitForNativeMuxReady()
-    {
-        var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
-        if (string.IsNullOrWhiteSpace(streamOutput))
-            return true;
-
-        var ready = NativeMuxReady.GetOrAdd(streamOutput, _ =>
-            new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
-
-        if (ready.Task.IsCompletedSuccessfully)
-            return true;
-
-        Logger.InfoMarkUp("[yellow]PIPE waiting for native mux readiness before first media write.[/]");
-        var ok = ready.Task.GetAwaiter().GetResult();
-        if (!ok)
-            throw new IOException("Native MPEG-TS mux failed to start.");
-
-        Logger.InfoMarkUp("[green]PIPE native mux ready; media copy may begin.[/]");
-        return true;
-    }
-
-    private sealed class NativeMuxReadyStream : Stream
-    {
-        private readonly Stream inner;
-        private bool ready;
-
-        public NativeMuxReadyStream(Stream inner) => this.inner = inner;
-
-        private void EnsureReady()
-        {
-            if (ready) return;
-            WaitForNativeMuxReady();
-            ready = true;
-        }
-
-        public override bool CanRead => inner.CanRead;
-        public override bool CanSeek => inner.CanSeek;
-        public override bool CanWrite => inner.CanWrite;
-        public override long Length => inner.Length;
-        public override long Position { get => inner.Position; set => inner.Position = value; }
-        public override void Flush() => inner.Flush();
-        public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
-        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
-        public override int Read(Span<byte> buffer) => inner.Read(buffer);
-        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => inner.ReadAsync(buffer, cancellationToken);
-        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => inner.ReadAsync(buffer, offset, count, cancellationToken);
-        public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
-        public override void SetLength(long value) => inner.SetLength(value);
-        public override void Write(byte[] buffer, int offset, int count)
-        {
-            EnsureReady();
-            inner.Write(buffer, offset, count);
-        }
-        public override void Write(ReadOnlySpan<byte> buffer)
-        {
-            EnsureReady();
-            inner.Write(buffer);
-        }
-        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-        {
-            EnsureReady();
-            return inner.WriteAsync(buffer, offset, count, cancellationToken);
-        }
-        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
-        {
-            EnsureReady();
-            return inner.WriteAsync(buffer, cancellationToken);
-        }
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) inner.Dispose();
-            base.Dispose(disposing);
-        }
-        public override ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 
     private static void RegisterNativePipeAndMaybeStartMux(string pipeName)
@@ -184,9 +105,6 @@ internal static class PipeUtil
         var streamOutput = Environment.GetEnvironmentVariable(StreamPipeOutputEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(streamOutput))
         {
-            var ready = NativeMuxReady.GetOrAdd(streamOutput, _ =>
-                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
-
             return NativeMuxTasks.GetOrAdd(streamOutput, key => Task.Run(async () =>
             {
                 try
@@ -195,19 +113,15 @@ internal static class PipeUtil
                     Logger.InfoMarkUp("[deepskyblue1]PIPE native mux task started.[/]");
                     Logger.InfoMarkUp($"[deepskyblue1]PIPE native mux inputs: {pipeNames.Length}[/]");
 
-                    // Signal readiness as soon as the native mux worker has started.
-                    // The input FIFOs are already open read/write on the producer side,
-                    // so the mux can immediately attach to them without another blocking
-                    // named-pipe handshake.
-                    ready.TrySetResult(true);
-
+                    // Both producer FIFOs have already been created/opened read/write.
+                    // Attach the native muxer directly; no producer-side readiness
+                    // handshake is required.
                     var result = await NativeFmp4TsMuxer.RunAsync(pipeNames, streamOutput);
                     Logger.InfoMarkUp($"[deepskyblue1]Native fMP4 -> MPEG-TS muxer returned: {result}[/]");
                     return result;
                 }
                 catch (Exception ex)
                 {
-                    ready.TrySetResult(false);
                     Logger.ErrorMarkUp($"[red]PIPE native mux worker failed: {ex.GetType().Name}: {ex.Message.EscapeMarkup()}[/]");
                     return false;
                 }
