@@ -32,6 +32,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lld
 
+      - name: Normalize diagnostic instrumentation for current model types
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/N_m3u8DL-RE/DownloadManager/SimpleLiveRecordManager2.cs')
+          s = p.read_text(encoding='utf-8-sig')
+          old = 'var observedPeriodId = streamSpec.Playlist?.PeriodId?.ToString() ?? "";'
+          new = 'var observedPeriodId = streamSpec.Playlist?.MediaInit?.Url ?? "";'
+          if old not in s:
+              raise SystemExit('Expected PeriodId instrumentation anchor not found')
+          s = s.replace(old, new, 1)
+          old = 'time={seg.StartTime}'
+          new = 'time={seg.DateTime}'
+          if old not in s:
+              raise SystemExit('Expected StartTime instrumentation anchor not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+
       - name: Restore NuGet packages
         run: dotnet restore src/N_m3u8DL-RE.Tests/N_m3u8DL-RE.Tests.csproj -r ${{ env.RID }}
 
