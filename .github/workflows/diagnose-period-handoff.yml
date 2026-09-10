@@ -1,0 +1,70 @@
+name: Diagnose live Period handoff
+
+on:
+  push:
+    branches:
+      - fix/live-dash-period-handoff
+    paths:
+      - '.github/workflows/diagnose-period-handoff.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/live-dash-period-handoff
+
+      - name: Add Period handoff diagnostics
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('src/N_m3u8DL-RE/DownloadManager/SimpleLiveRecordManager2.cs')
+          text = path.read_text(encoding='utf-8-sig')
+
+          old = '''        bool initDownloaded = false; // 是否下载过init文件\n        ConcurrentDictionary<MediaSegment, DownloadResult?> FileDic = new();'''
+          new = '''        bool initDownloaded = false; // 是否下载过init文件\n        string activePeriodId = "";\n        string activeInitUrl = "";\n        int periodTransitionSegmentsLogged = 0;\n        ConcurrentDictionary<MediaSegment, DownloadResult?> FileDic = new();'''
+          assert old in text, 'state declaration anchor not found'
+          text = text.replace(old, new, 1)
+
+          old = '''            var segmentsDuration = segments.Sum(s => s.Duration);\n            Logger.DebugMarkUp(string.Join(",", segments.Select(sss => GetSegmentName(sss, false, false))));\n\n            // 下载init'''
+          new = '''            var segmentsDuration = segments.Sum(s => s.Duration);\n            Logger.DebugMarkUp(string.Join(",", segments.Select(sss => GetSegmentName(sss, false, false))));\n\n            // Diagnose live DASH Period/init handoff without changing recording behavior.\n            var observedPeriodId = streamSpec.Playlist?.PeriodId?.ToString() ?? "";\n            var observedInitUrl = streamSpec.Playlist?.MediaInit?.Url ?? "";\n            var observedKid = streamSpec.Playlist?.MediaInit?.EncryptInfo.KID ?? "";\n            var periodChanged = !string.IsNullOrEmpty(activePeriodId) &&\n                                (observedPeriodId != activePeriodId || observedInitUrl != activeInitUrl);\n            if (periodChanged)\n            {\n                periodTransitionSegmentsLogged = 0;\n                Logger.WarnMarkUp($"[DASH-HANDOFF] PERIOD CHANGE stream={task.Id} oldPeriod={activePeriodId} newPeriod={observedPeriodId} oldInit={activeInitUrl} newInit={observedInitUrl} newKID={observedKid}");\n            }\n            else if (string.IsNullOrEmpty(activePeriodId) && (!string.IsNullOrEmpty(observedPeriodId) || !string.IsNullOrEmpty(observedInitUrl)))\n            {\n                Logger.WarnMarkUp($"[DASH-HANDOFF] INITIAL PERIOD stream={task.Id} period={observedPeriodId} init={observedInitUrl} KID={observedKid}");\n            }\n            activePeriodId = observedPeriodId;\n            activeInitUrl = observedInitUrl;\n\n            // 下载init'''
+          assert old in text, 'handoff anchor not found'
+          text = text.replace(old, new, 1)
+
+          old = '''                var path = Path.Combine(tmpDir, "_init.mp4.tmp");\n                var result = await Downloader.DownloadSegmentAsync(streamSpec.Playlist.MediaInit, path, speedContainer, headers);\n                FileDic[streamSpec.Playlist.MediaInit] = result;'''
+          new = '''                var path = Path.Combine(tmpDir, "_init.mp4.tmp");\n                Logger.WarnMarkUp($"[DASH-HANDOFF] INIT DOWNLOAD stream={task.Id} period={activePeriodId} url={streamSpec.Playlist.MediaInit.Url} mpdKID={streamSpec.Playlist.MediaInit.EncryptInfo.KID}");\n                var result = await Downloader.DownloadSegmentAsync(streamSpec.Playlist.MediaInit, path, speedContainer, headers);\n                Logger.WarnMarkUp($"[DASH-HANDOFF] INIT RESULT stream={task.Id} success={result?.Success} actual={result?.ActualFilePath}");\n                FileDic[streamSpec.Playlist.MediaInit] = result;'''
+          assert old in text, 'init download anchor not found'
+          text = text.replace(old, new, 1)
+
+          old = '''                        var dResult = await MP4DecryptUtil.DecryptAsync(decryptEngine, decryptionBinaryPath, DownloaderConfig.MyOptions.Keys, enc, dec, currentKID);\n                        if (dResult)\n                        {\n                            FileDic[streamSpec.Playlist.MediaInit]!.ActualFilePath = dec;\n                        }'''
+          new = '''                        var dResult = await MP4DecryptUtil.DecryptAsync(decryptEngine, decryptionBinaryPath, DownloaderConfig.MyOptions.Keys, enc, dec, currentKID);\n                        Logger.WarnMarkUp($"[DASH-HANDOFF] INIT DECRYPT stream={task.Id} period={activePeriodId} KID={currentKID} success={dResult} enc={enc} dec={dec}");\n                        if (dResult)\n                        {\n                            FileDic[streamSpec.Playlist.MediaInit]!.ActualFilePath = dec;\n                        }'''
+          assert old in text, 'init decrypt anchor not found'
+          text = text.replace(old, new, 1)
+
+          old = '''                var result = await Downloader.DownloadSegmentAsync(seg, path, speedContainer, headers);\n                FileDic[seg] = result;\n                if (result is { Success: true })\n                    task.Increment(1);\n                // 实时解密\n                if (seg.IsEncrypted && DownloaderConfig.MyOptions.MP4RealTimeDecryption && result is { Success: true } && !string.IsNullOrEmpty(currentKID))'''
+          new = '''                var result = await Downloader.DownloadSegmentAsync(seg, path, speedContainer, headers);\n                FileDic[seg] = result;\n                var traceSegmentNo = Interlocked.Increment(ref periodTransitionSegmentsLogged);\n                if (traceSegmentNo <= 8)\n                {\n                    Logger.WarnMarkUp($"[DASH-HANDOFF] SEGMENT RESULT stream={task.Id} traceNo={traceSegmentNo} period={activePeriodId} index={seg.Index} time={seg.StartTime} encrypted={seg.IsEncrypted} success={result?.Success} url={seg.Url} actual={result?.ActualFilePath}");\n                }\n                if (result is { Success: true })\n                    task.Increment(1);\n                // 实时解密\n                if (seg.IsEncrypted && DownloaderConfig.MyOptions.MP4RealTimeDecryption && result is { Success: true } && !string.IsNullOrEmpty(currentKID))'''
+          assert old in text, 'parallel segment anchor not found'
+          text = text.replace(old, new, 1)
+
+          old = '''                    var dResult = await MP4DecryptUtil.DecryptAsync(decryptEngine, decryptionBinaryPath, DownloaderConfig.MyOptions.Keys, enc, dec, currentKID, mp4InitFile);\n                    if (dResult)\n                    {\n                        File.Delete(enc);\n                        result.ActualFilePath = dec;\n                    }'''
+          new = '''                    var dResult = await MP4DecryptUtil.DecryptAsync(decryptEngine, decryptionBinaryPath, DownloaderConfig.MyOptions.Keys, enc, dec, currentKID, mp4InitFile);\n                    if (traceSegmentNo <= 8)\n                    {\n                        Logger.WarnMarkUp($"[DASH-HANDOFF] SEGMENT DECRYPT stream={task.Id} traceNo={traceSegmentNo} period={activePeriodId} index={seg.Index} KID={currentKID} init={mp4InitFile} success={dResult} enc={enc} dec={dec}");\n                    }\n                    if (dResult)\n                    {\n                        File.Delete(enc);\n                        result.ActualFilePath = dec;\n                    }'''
+          assert old in text, 'parallel decrypt anchor not found'
+          text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8-sig')
+
+      - name: Commit diagnostics and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/N_m3u8DL-RE/DownloadManager/SimpleLiveRecordManager2.cs
+          git rm .github/workflows/diagnose-period-handoff.yml
+          git commit -m "Instrument live DASH Period handoff"
+          git push origin HEAD:fix/live-dash-period-handoff
