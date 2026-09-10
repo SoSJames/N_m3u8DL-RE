@@ -55,14 +55,6 @@ internal sealed class NativeFmp4TsMuxer
         {
             if (!int.TryParse(path[14..], out var fd) || fd < 0)
                 throw new ArgumentException($"Invalid anonymous pipe fd path: {path}");
-
-            // Anonymous Linux pipes are synchronous kernel handles. Opening the
-            // SafeFileHandle with isAsync=true makes .NET reject the handle with
-            // "Handle does not support asynchronous operations". The mux already
-            // runs on its own explicit thread, so a synchronous FileStream is the
-            // correct and safe representation here. WriteAsync will use the
-            // synchronous handle without requiring an overlapped/async handle.
-            Logger.InfoMarkUp($"[yellow]Native mux binding inherited synchronous pipe fd={fd}[/]");
             var handle = new SafeFileHandle((IntPtr)fd, ownsHandle: false);
             return new FileStream(handle, FileAccess.Write, 1024 * 1024, isAsync: false);
         }
@@ -196,6 +188,7 @@ internal sealed class NativeFmp4TsMuxer
     }
 
     private static long ParseTfdt(byte[] p) { if (p.Length < 8) return 0; return p[0] == 1 ? (long)BinaryPrimitives.ReadUInt64BigEndian(p.AsSpan(4, 8)) : BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(4, 4)); }
+    private static uint ReadU32(byte[] p, int offset) => BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(offset, 4));
     private static uint ReadDefaultDuration(byte[]? p, Track t) => p != null && p.Length >= 16 && (BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(0, 4)) & 8) != 0 ? BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(12, 4)) : t.TrexDefaultDuration;
     private static uint ReadDefaultSize(byte[]? p, Track t) => p != null && p.Length >= 20 && (BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(0, 4)) & 16) != 0 ? BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(16, 4)) : t.TrexDefaultSize;
     private static uint ReadDefaultFlags(byte[]? p, Track t) => p != null && p.Length >= 24 && (BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(0, 4)) & 32) != 0 ? BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(20, 4)) : t.TrexDefaultFlags;
@@ -234,7 +227,7 @@ internal sealed class NativeFmp4TsMuxer
 
     private void WriteRaw(byte[] ts) { output.Write(ts, 0, ts.Length); tsPacketsWritten++; tsBytesWritten += ts.Length; if ((tsPacketsWritten % 100) == 0) Logger.WarnMarkUp($"[PIPE-TS] raw TS packet #{tsPacketsWritten} bytes={ts.Length} cumulativeTsBytes={tsBytesWritten}"); }
     private static void WriteCrc(byte[] b, int off, int len) { uint crc = 0xFFFFFFFF; for (var i = off; i < len; i++) { crc ^= (uint)b[i] << 24; for (var j = 0; j < 8; j++) crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ 0x04C11DB7 : crc << 1; } b[len] = (byte)(crc >> 24); b[len + 1] = (byte)(crc >> 16); b[len + 2] = (byte)(crc >> 8); b[len + 3] = (byte)crc; }
-    private static void PutPts(byte[] b, int off, long pts, int prefix) { ulong v = (ulong)Math.Max(0, pts) & ((1UL << 33) - 1); b[off] = (byte)((prefix << 4) | (((v >> 30) & 7) << 1) | 1); b[off + 1] = (byte)(v >> 22); b[off + 2] = (byte)(((v >> 15) & 0x7F) << 1 | 1); b[off + 3] = (byte)(v >> 7); b[off + 4] = (byte)(((v & 0x7F) << 1) | 1); }
+    private static void PutPts(byte[] b, int off, long pts, int prefix) { ulong v = (ulong)Math.Max(0, pts) & ((1UL << 33) - 1); b[off] = (byte)(((ulong)(prefix << 4)) | (((v >> 30) & 7) << 1) | 1); b[off + 1] = (byte)(v >> 22); b[off + 2] = (byte)((((v >> 15) & 0x7F) << 1) | 1); b[off + 3] = (byte)(v >> 7); b[off + 4] = (byte)(((v & 0x7F) << 1) | 1); }
 
     private sealed class BoxReader
     {
