@@ -1,0 +1,39 @@
+name: One-shot native mux fix
+on:
+  push:
+    branches: [test-stream-pipe-x9k3]
+permissions:
+  contents: write
+jobs:
+  fix:
+    if: github.actor == 'SoSJames'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test-stream-pipe-x9k3
+      - name: Patch FindBox
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('src/N_m3u8DL-RE/Util/NativeFmp4TsMuxer.cs')
+          s = p.read_text()
+          old = 'private static Box? FindBox(byte[]d,string t)=>FindBoxes(d,t).FirstOrDefault();'
+          new = '''private static Box? FindBox(byte[]d,string t){foreach(var b in FindBoxes(d,t))return b;return null;}'''
+          if old not in s:
+              raise SystemExit('FindBox pattern not found')
+          s = s.replace(old, new, 1)
+          old2 = 'private static byte[]? FindDescriptor(byte[]d,byte tag){for(int i=0;i<d.Length-2;i++)'
+          new2 = 'private static byte[]? FindDescriptor(byte[]d,byte tag){if(d==null)return null;for(int i=0;i<d.Length-2;i++)'
+          if old2 not in s:
+              raise SystemExit('FindDescriptor pattern not found')
+          s = s.replace(old2, new2, 1)
+          p.write_text(s)
+      - name: Commit fix and remove workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/N_m3u8DL-RE/Util/NativeFmp4TsMuxer.cs
+          git rm .github/workflows/one-shot-fix-native-mux.yml
+          git commit -m 'Fix native mux FindBox default struct bug'
+          git push origin HEAD:test-stream-pipe-x9k3
