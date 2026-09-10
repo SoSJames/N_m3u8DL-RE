@@ -128,7 +128,7 @@ internal sealed class NativeFmp4TsMuxer
             {
                 WritePsi();
                 psiWritten = true;
-                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/]");
+                Logger.InfoMarkUp("[green]Native mux emitted PAT/PMT.[/");
             }
             var pts = Scale90((long)s.Dts + s.Cto, t.TimeScale);
             var dts = Scale90((long)s.Dts, t.TimeScale);
@@ -252,41 +252,109 @@ internal sealed class NativeFmp4TsMuxer
             var tfdt = FindBox(traf.Payload, "tfdt");
             var trun = FindBox(traf.Payload, "trun");
             if (trun == null) continue;
+
+            var tfhdPayload = tfhd?.Payload;
+            var trunPayload = trun.Value.Payload;
+            if (trunPayload.Length < 8)
+            {
+                Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: malformed trun payload={trunPayload.Length}");
+                continue;
+            }
+
+            var tfhdFlags = tfhdPayload != null && tfhdPayload.Length >= 8 ? ReadU24(tfhdPayload, 0) : 0;
+            var trunFlags = ReadU24(trunPayload, 0);
+            var sampleCount = ReadU32(trunPayload, 4);
+            Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: tfhdFlags=0x{tfhdFlags:X6} trunFlags=0x{trunFlags:X6} samples={sampleCount} tfhdBytes={(tfhdPayload?.Length ?? 0)} trunBytes={trunPayload.Length} mdat={mdat.Length}");
+
             ulong dts = 0;
-            if (tfdt != null && tfdt.Value.Payload.Length >= 12)
-                dts = tfdt.Value.Payload[0] == 1 ? BinaryPrimitives.ReadUInt64BigEndian(tfdt.Value.Payload.AsSpan(4, 8)) : BinaryPrimitives.ReadUInt32BigEndian(tfdt.Value.Payload.AsSpan(4, 4));
+            if (tfdt != null && tfdt.Value.Payload.Length >= 8)
+                dts = tfdt.Value.Payload[0] == 1 && tfdt.Value.Payload.Length >= 12
+                    ? BinaryPrimitives.ReadUInt64BigEndian(tfdt.Value.Payload.AsSpan(4, 8))
+                    : BinaryPrimitives.ReadUInt32BigEndian(tfdt.Value.Payload.AsSpan(4, 4));
+
             uint defDur = 0, defSize = 0;
-            if (tfhd != null)
+            long baseDataOffset = -1;
+            if (tfhdPayload != null && tfhdPayload.Length >= 8)
             {
-                var p = tfhd.Value.Payload; var flags = ReadU24(p, 0); var pos = 8;
-                if ((flags & 1) != 0) pos += 8;
-                if ((flags & 2) != 0) pos += 4;
-                if ((flags & 8) != 0 && pos + 4 <= p.Length) { defDur = ReadU32(p, pos); pos += 4; }
-                if ((flags & 16) != 0 && pos + 4 <= p.Length) defSize = ReadU32(p, pos);
+                var pos = 8;
+                if ((tfhdFlags & 0x000001) != 0)
+                {
+                    if (pos + 8 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd base-data-offset"); continue; }
+                    baseDataOffset = unchecked((long)BinaryPrimitives.ReadUInt64BigEndian(tfhdPayload.AsSpan(pos, 8)));
+                    pos += 8;
+                }
+                if ((tfhdFlags & 0x000002) != 0) pos += 4;
+                if ((tfhdFlags & 0x000008) != 0)
+                {
+                    if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd default-duration"); continue; }
+                    defDur = ReadU32(tfhdPayload, pos); pos += 4;
+                }
+                if ((tfhdFlags & 0x000010) != 0)
+                {
+                    if (pos + 4 > tfhdPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: truncated tfhd default-size"); continue; }
+                    defSize = ReadU32(tfhdPayload, pos);
+                }
             }
-            var p2 = trun.Value.Payload; if (p2.Length < 8) continue;
-            var flags2 = ReadU24(p2, 0); var count = ReadU32(p2, 4); var pos2 = 8;
-            int dataPos = 0;
-            if ((flags2 & 1) != 0)
+
+            var pos2 = 8;
+            long dataPos = 0;
+            if ((trunFlags & 0x000001) != 0)
             {
-                var dataOffset = unchecked((int)ReadU32(p2, pos2));
+                if (pos2 + 4 > trunPayload.Length) continue;
+                var dataOffset = unchecked((int)ReadU32(trunPayload, pos2));
                 pos2 += 4;
-                var moofSize = 8 + moof.Length;
-                if (dataOffset >= moofSize && dataOffset - moofSize <= mdat.Length)
-                    dataPos = dataOffset - moofSize;
+                var moofBoxSize = 8L + moof.Length;
+                dataPos = (long)dataOffset - moofBoxSize;
+                if (baseDataOffset >= 0)
+                    dataPos = baseDataOffset + dataOffset - moofBoxSize;
             }
-            if ((flags2 & 4) != 0) pos2 += 4;
-            for (uint i = 0; i < count && pos2 <= p2.Length; i++)
+            else if (baseDataOffset >= 0)
             {
-                var dur = defDur; var size = defSize; var sf = 0u; var cto = 0;
-                if ((flags2 & 0x100) != 0) { dur = ReadU32(p2, pos2); pos2 += 4; }
-                if ((flags2 & 0x200) != 0) { size = ReadU32(p2, pos2); pos2 += 4; }
-                if ((flags2 & 0x400) != 0) { sf = ReadU32(p2, pos2); pos2 += 4; }
-                if ((flags2 & 0x800) != 0) { cto = (int)ReadU32(p2, pos2); pos2 += 4; }
-                if (size == 0 || dataPos + size > mdat.Length) break;
-                result.Add(new Sample(mdat.AsSpan(dataPos, checked((int)size)).ToArray(), dts, cto, (sf & 0x10000) == 0));
+                var moofBoxStart = baseDataOffset;
+                var currentMdatStart = moofBoxStart + 8L + moof.Length;
+                dataPos = currentMdatStart - moofBoxStart;
+            }
+            if (dataPos < 0 || dataPos > mdat.Length) dataPos = 0;
+
+            if ((trunFlags & 0x000004) != 0)
+            {
+                if (pos2 + 4 > trunPayload.Length) continue;
+                pos2 += 4;
+            }
+
+            Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dts={dts} defDur={defDur} defSize={defSize} dataPos={dataPos} entryBytes={trunPayload.Length-pos2}");
+
+            for (uint i = 0; i < sampleCount; i++)
+            {
+                var dur = defDur;
+                var size = defSize;
+                var sf = 0u;
+                var cto = 0;
+                if ((trunFlags & 0x000100) != 0)
+                {
+                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing duration"); break; }
+                    dur = ReadU32(trunPayload, pos2); pos2 += 4;
+                }
+                if ((trunFlags & 0x000200) != 0)
+                {
+                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing size"); break; }
+                    size = ReadU32(trunPayload, pos2); pos2 += 4;
+                }
+                if ((trunFlags & 0x000400) != 0)
+                {
+                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing flags"); break; }
+                    sf = ReadU32(trunPayload, pos2); pos2 += 4;
+                }
+                if ((trunFlags & 0x000800) != 0)
+                {
+                    if (pos2 + 4 > trunPayload.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing CTO"); break; }
+                    cto = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4;
+                }
+                if (size == 0) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} has zero size (flags=0x{trunFlags:X6})"); break; }
+                if (dataPos + size > mdat.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} exceeds mdat: pos={dataPos} size={size} mdat={mdat.Length}"); break; }
+                result.Add(new Sample(mdat.AsSpan(checked((int)dataPos), checked((int)size)).ToArray(), dts, cto, (sf & 0x10000) == 0));
                 dts += dur;
-                dataPos += checked((int)size);
+                dataPos += size;
             }
         }
         return result;
