@@ -34,8 +34,8 @@ internal sealed class NativeFmp4TsMuxer
             await using var p1 = OpenPipe(pipeNames[1]);
             Logger.InfoMarkUp("[green]Native mux input pipe 1 opened.[/]");
 
-            var leaveOpen = IsAnonymousPipeOutput(outputPath);
-            Logger.InfoMarkUp($"[yellow]Native mux opening MPEG-TS output: {outputPath.EscapeMarkup()} anonymousPipe={leaveOpen}[/]");
+            var anonymousPipe = IsAnonymousPipeOutput(outputPath);
+            Logger.InfoMarkUp($"[yellow]Native mux opening MPEG-TS output: {outputPath.EscapeMarkup()} anonymousPipe={anonymousPipe}[/]");
             await using var dst = OpenOutput(outputPath);
             Logger.InfoMarkUp("[green]Native mux MPEG-TS output opened.[/]");
             var mux = new NativeFmp4TsMuxer(dst);
@@ -55,8 +55,16 @@ internal sealed class NativeFmp4TsMuxer
         {
             if (!int.TryParse(path[14..], out var fd) || fd < 0)
                 throw new ArgumentException($"Invalid anonymous pipe fd path: {path}");
+
+            // Anonymous Linux pipes are synchronous kernel handles. Opening the
+            // SafeFileHandle with isAsync=true makes .NET reject the handle with
+            // "Handle does not support asynchronous operations". The mux already
+            // runs on its own explicit thread, so a synchronous FileStream is the
+            // correct and safe representation here. WriteAsync will use the
+            // synchronous handle without requiring an overlapped/async handle.
+            Logger.InfoMarkUp($"[yellow]Native mux binding inherited synchronous pipe fd={fd}[/]");
             var handle = new SafeFileHandle((IntPtr)fd, ownsHandle: false);
-            return new FileStream(handle, FileAccess.Write, 1024 * 1024, isAsync: true);
+            return new FileStream(handle, FileAccess.Write, 1024 * 1024, isAsync: false);
         }
         return new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
     }
@@ -167,38 +175,84 @@ internal sealed class NativeFmp4TsMuxer
     {
         var result = new List<Sample>(); foreach (var traf in FindBoxes(moof, "traf"))
         {
-            var tfhd = FindBox(traf.Payload, "tfhd"); var tfdt = FindBox(traf.Payload, "tfdt"); var trun = FindBox(traf.Payload, "trun"); if (trun == null) continue; var tfhdPayload = tfhd?.Payload; var trunPayload = trun.Value.Payload; if (trunPayload.Length < 8) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: malformed trun payload={trunPayload.Length}"); continue; }
-            var tfhdFlags = tfhdPayload != null && tfhdPayload.Length >= 8 ? ReadU24(tfhdPayload, 0) : 0; var trunFlags = ReadU24(trunPayload, 0); var sampleCount = ReadU32(trunPayload, 4); Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: tfhdFlags=0x{tfhdFlags:X6} trunFlags=0x{trunFlags:X6} samples={sampleCount} tfhdBytes={(tfhdPayload?.Length ?? 0)} trunBytes={trunPayload.Length} mdat={mdat.Length}");
-            ulong dts = 0; if (tfdt != null && tfdt.Value.Payload.Length >= 8) { var p = tfdt.Value.Payload; if (p[0] == 1 && p.Length >= 12) dts = BinaryPrimitives.ReadUInt64BigEndian(p.AsSpan(4, 8)); else dts = BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(4, 4)); }
-            uint defDur = 0, defSize = 0, defFlags = 0; long baseDataOffset = -1; if (tfhdPayload != null && tfhdPayload.Length >= 8) { var pos = 8; if ((tfhdFlags & 0x000001) != 0) { if (pos + 8 > tfhdPayload.Length) continue; baseDataOffset = unchecked((long)BinaryPrimitives.ReadUInt64BigEndian(tfhdPayload.AsSpan(pos, 8))); pos += 8; } if ((tfhdFlags & 0x000002) != 0) { if (pos + 4 > tfhdPayload.Length) continue; pos += 4; } if ((tfhdFlags & 0x000008) != 0) { if (pos + 4 > tfhdPayload.Length) continue; defDur = ReadU32(tfhdPayload, pos); pos += 4; } if ((tfhdFlags & 0x000010) != 0) { if (pos + 4 > tfhdPayload.Length) continue; defSize = ReadU32(tfhdPayload, pos); pos += 4; } if ((tfhdFlags & 0x000020) != 0) { if (pos + 4 > tfhdPayload.Length) continue; defFlags = ReadU32(tfhdPayload, pos); } }
-            if (defDur == 0) defDur = t.TrexDefaultDuration; if (defSize == 0) defSize = t.TrexDefaultSize; if (defFlags == 0) defFlags = t.TrexDefaultFlags;
-            var pos2 = 8; long dataPos; if ((trunFlags & 0x000001) != 0) { if (pos2 + 4 > trunPayload.Length) continue; var dataOffset = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4; var moofBoxSize = 8L + moof.Length; dataPos = (tfhdFlags & 0x020000) != 0 ? dataOffset - moofBoxSize : baseDataOffset >= 0 ? baseDataOffset + dataOffset - moofBoxSize : dataOffset - moofBoxSize; Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dataOffset={dataOffset} moofBoxSize={moofBoxSize} resolvedDataPos={dataPos}"); } else dataPos = (tfhdFlags & 0x020000) != 0 || baseDataOffset < 0 ? 0 : baseDataOffset - (8L + moof.Length);
-            if (dataPos < 0 || dataPos > mdat.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dataPos out of range: {dataPos}, forcing 0"); dataPos = 0; }
-            if ((trunFlags & 0x000004) != 0) { if (pos2 + 4 > trunPayload.Length) continue; pos2 += 4; }
-            var entryBytes = trunPayload.Length - pos2; var compactDurationSize = (trunFlags & 0x000300) == 0 && sampleCount > 0 && entryBytes == sampleCount * 8u; var compactDurationSizeCto = (trunFlags & 0x000300) == 0 && sampleCount > 0 && entryBytes == sampleCount * 12u; var compactDurationSizeCtoTrailing = (trunFlags & 0x000300) == 0 && sampleCount > 0 && entryBytes == sampleCount * 12u + 4u; var compatibilityCtoBytes = compactDurationSizeCto || compactDurationSizeCtoTrailing;
-            if (compactDurationSize) Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: non-standard trun compatibility layout detected; perSampleBytes=8; interpreting duration+size"); else if (compatibilityCtoBytes) { var extra = compactDurationSizeCtoTrailing ? 4 : 0; Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: non-standard trun compatibility layout detected; perSampleBytes={(entryBytes - extra) / sampleCount}; interpreting duration+size+cto{(extra > 0 ? $"; trailingBytes={extra}" : "")}"); if (extra > 0) Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: compatibility trailing field=0x{ReadU32(trunPayload, trunPayload.Length - 4):X8}"); }
-            Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: dts={dts} defDur={defDur} defSize={defSize} defFlags=0x{defFlags:X8} dataPos={dataPos} entryBytes={entryBytes}"); var sampleRecordEnd = compactDurationSizeCtoTrailing ? trunPayload.Length - 4 : trunPayload.Length;
-            for (uint i = 0; i < sampleCount; i++) { var dur = defDur; var size = defSize; var sf = defFlags; var cto = 0; if (compactDurationSize) { if (pos2 + 8 > sampleRecordEnd) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing compatibility duration/size"); break; } dur = ReadU32(trunPayload, pos2); pos2 += 4; size = ReadU32(trunPayload, pos2); pos2 += 4; } else if (compatibilityCtoBytes) { if (pos2 + 12 > sampleRecordEnd) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} missing compatibility duration/size/CTO"); break; } dur = ReadU32(trunPayload, pos2); pos2 += 4; size = ReadU32(trunPayload, pos2); pos2 += 4; cto = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4; } else { if ((trunFlags & 0x000100) != 0) { if (pos2 + 4 > trunPayload.Length) break; dur = ReadU32(trunPayload, pos2); pos2 += 4; } if ((trunFlags & 0x000200) != 0) { if (pos2 + 4 > trunPayload.Length) break; size = ReadU32(trunPayload, pos2); pos2 += 4; } if ((trunFlags & 0x000400) != 0) { if (pos2 + 4 > trunPayload.Length) break; sf = ReadU32(trunPayload, pos2); pos2 += 4; } if ((trunFlags & 0x000800) != 0) { if (pos2 + 4 > trunPayload.Length) break; cto = unchecked((int)ReadU32(trunPayload, pos2)); pos2 += 4; } } if (size == 0) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} has zero size (flags=0x{trunFlags:X6}, trexSize={t.TrexDefaultSize})"); break; } if (dataPos + size > mdat.Length) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} exceeds mdat: pos={dataPos} size={size} mdat={mdat.Length}"); break; } if (i < 2) Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: sample {i} duration={dur} size={size} cto={cto} dataPos={dataPos}"); result.Add(new Sample(mdat.AsSpan(checked((int)dataPos), checked((int)size)).ToArray(), dts, cto, (sf & 0x10000) == 0)); dts += dur; dataPos += size; }
+            var tfhd = FindBox(traf.Payload, "tfhd"); var tfdt = FindBox(traf.Payload, "tfdt"); var trun = FindBox(traf.Payload, "trun"); if (trun == null) continue; var tfhdPayload = tfhd?.Payload; var trunPayload = trun.Value.Payload; if (trunPayload.Length < 8) { Logger.WarnMarkUp($"[PIPE-DIAG] fragment {t.Kind}: malformed trun"); continue; }
+            var flags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(0, 4)); var count = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(4, 4)); var pos = 8;
+            long dts = tfdt == null ? 0 : ParseTfdt(tfdt.Value.Payload); var dataOffset = 0; if ((flags & 0x000001) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun data_offset missing"); dataOffset = BinaryPrimitives.ReadInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+            uint firstFlags = 0; if ((flags & 0x000004) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun first_sample_flags missing"); firstFlags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+            var defaultDuration = ReadDefaultDuration(tfhdPayload, t); var defaultSize = ReadDefaultSize(tfhdPayload, t); var defaultFlags = ReadDefaultFlags(tfhdPayload, t);
+            var sampleBase = dataOffset != 0 ? dataOffset : 0;
+            for (uint i = 0; i < count; i++)
+            {
+                uint dur = defaultDuration, size = defaultSize, sflags = i == 0 && (flags & 0x000004) != 0 ? firstFlags : defaultFlags; int cto = 0;
+                if ((flags & 0x000100) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun sample duration missing"); dur = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+                if ((flags & 0x000200) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun sample size missing"); size = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+                if ((flags & 0x000400) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun sample flags missing"); sflags = BinaryPrimitives.ReadUInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+                if ((flags & 0x000800) != 0) { if (pos + 4 > trunPayload.Length) throw new InvalidDataException("trun sample cto missing"); cto = BinaryPrimitives.ReadInt32BigEndian(trunPayload.AsSpan(pos, 4)); pos += 4; }
+                var off = sampleBase; if (off < 0 || off > mdat.Length || size > mdat.Length - off) { Logger.WarnMarkUp($"[PIPE-DIAG] sample {i} exceeds mdat: offset={off} size={size} mdat={mdat.Length}; clamping"); size = (uint)Math.Max(0, mdat.Length - Math.Max(0, off)); }
+                result.Add(new Sample(mdat.AsSpan(off, checked((int)size)).ToArray(), dts, cto, dur, sflags)); sampleBase = checked(sampleBase + (int)size); dts += dur;
+            }
         }
         return result;
     }
 
-    private void WritePsi() { var pat = new byte[188]; Array.Fill(pat, (byte)0xFF); Header(pat, 0, true, ref pmtCc); pat[4] = 0; var ps = new byte[] { 0, 0xB0, 0x0D, 0, 1, 0xC1, 0, 0, 0, 1, 0xF0, 0, 0, 0, 0, 0 }; Crc(ps, 0, 12); Buffer.BlockCopy(ps, 0, pat, 5, 16); output.Write(pat); var pmt = new byte[188]; Array.Fill(pmt, (byte)0xFF); Header(pmt, PmtPid, true, ref pmtCc); pmt[4] = 0; var body = new byte[26]; body[0]=2; body[1]=0xB0; body[2]=0x17; body[3]=0; body[4]=1; body[5]=0xC1; body[6]=0; body[7]=0; body[8]=0xE1; body[9]=0; body[10]=0xF0; body[11]=0; body[12]=(byte)(video!.Codec==Codec.H265?0x24:0x1B); body[13]=0xE1; body[14]=0; body[15]=0xF0; body[16]=0; body[17]=0x0F; body[18]=0xE1; body[19]=1; body[20]=0xF0; body[21]=0; Crc(body,0,22); Buffer.BlockCopy(body,0,pmt,5,26); output.Write(pmt); Logger.WarnMarkUp("[PIPE-TS] WritePsi wrote PAT=188 bytes and PMT=188 bytes; totalTsBytes=376"); tsPacketsWritten += 2; tsBytesWritten += 376; }
-    private void WritePes(byte[] payload, int pid, long pts, long dts, bool videoPes, ref int cc) { var h = new byte[dts == pts ? 14 : 19]; h[0]=0; h[1]=0; h[2]=1; h[3]=(byte)(videoPes?0xE0:0xC0); h[6]=(byte)(dts==pts?0x80:0xC0); h[7]=(byte)(dts==pts?5:10); WritePts(h.AsSpan(8), dts==pts?0x20:0x30, pts); if(dts!=pts) WritePts(h.AsSpan(13),0x10,dts); var pesLen = payload.Length + h.Length - 6; BinaryPrimitives.WriteUInt16BigEndian(h.AsSpan(4,2), pesLen <= 0xFFFF ? (ushort)pesLen : (ushort)0); var src = new byte[h.Length+payload.Length]; Buffer.BlockCopy(h,0,src,0,h.Length); Buffer.BlockCopy(payload,0,src,h.Length,payload.Length); var off=0; var first=true; var packetCount=0; var byteCount=0; while(off<src.Length) { var ts=new byte[188]; Array.Fill(ts,(byte)0xFF); ts[0]=0x47; ts[1]=(byte)(((pid>>8)&0x1F)|(first?0x40:0)); ts[2]=(byte)pid; var n=Math.Min(184,src.Length-off); var useAdapt=n<184; ts[3]=(byte)((useAdapt?0x30:0x10)|(cc++&15)); var p=4; if(useAdapt){var stuffing=182-n;ts[4]=(byte)(183-n);ts[5]=0;p=6+stuffing;} Buffer.BlockCopy(src,off,ts,p,n); off+=n; output.Write(ts); first=false; packetCount++; byteCount+=188; } pesWrites++; tsPacketsWritten += packetCount; tsBytesWritten += byteCount; if (pesWrites <= 5 || pesWrites % 100 == 0) Logger.WarnMarkUp($"[PIPE-TS] PES write #{pesWrites}: kind={(videoPes ? "video" : "audio")} pid=0x{pid:X} payload={payload.Length} pesBytes={src.Length} packets={packetCount} bytes={byteCount} pts={pts} dts={dts} cumulativeTsBytes={tsBytesWritten}"); }
-    private static byte[] ConvertVideo(byte[] data, Track t){using var ms=new MemoryStream(data.Length+32);var p=0;while(p+t.NalLengthSize<=data.Length){var n=t.NalLengthSize switch{1=>data[p],2=>BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(p,2)),3=>(data[p]<<16)|(data[p+1]<<8)|data[p+2],_=>checked((int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(p,4)))};p+=t.NalLengthSize;if(n<=0||p+n>data.Length)break;ms.Write(new byte[]{0,0,0,1});ms.Write(data,p,n);p+=n;}return ms.ToArray();}
-    private static byte[] AddAdts(byte[] a,Track t){var len=a.Length+7;var h=new byte[len];h[0]=0xFF;h[1]=0xF1;h[2]=(byte)(Math.Clamp(t.AacProfile-1,0,3)<<6|t.AacFreq<<2|t.Channels>>2);h[3]=(byte)((t.Channels&3)<<6|(len>>11&3));h[4]=(byte)(len>>3);h[5]=(byte)((len&7)<<5|0x1F);h[6]=0xFC;Buffer.BlockCopy(a,0,h,7,a.Length);return h;}
-    private static long Scale90(long x,uint scale)=>scale==0?x:x*90000L/(long)scale;
-    private static void WritePts(Span<byte>d,int prefix,long v){v&=0x1FFFFFFFFL;d[0]=(byte)(prefix|(((v>>30)&7)<<1)|1);d[1]=(byte)(v>>22);d[2]=(byte)((((v>>15)&0x7F)<<1)|1);d[3]=(byte)(v>>7);d[4]=(byte)(((v&0x7F)<<1)|1);}
-    private static void Header(byte[] b,int pid,bool pusi,ref int cc){b[0]=0x47;b[1]=(byte)(((pid>>8)&0x1F)|(pusi?0x40:0));b[2]=(byte)pid;b[3]=(byte)(0x10|(cc++&15));}
-    private static void Crc(byte[] b,int start,int len){uint c=0xFFFFFFFF;for(int i=start;i<start+len;i++){c^=(uint)b[i]<<24;for(int j=0;j<8;j++)c=(c&0x80000000)!=0?(c<<1)^0x04C11DB7:c<<1;}BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(start+len,4),c);}
-    private static int ReadU24(byte[]p,int i)=>(p[i]<<16)|(p[i+1]<<8)|p[i+2]; private static uint ReadU32(byte[]p,int i)=>BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(i,4));
-    private static int Frequency(int i)=>i switch{0=>96000,1=>88200,2=>64000,3=>48000,4=>44100,5=>32000,6=>24000,7=>22050,8=>16000,9=>12000,10=>11025,11=>8000,12=>7350,_=>48000};
-    private static byte[]? FindDescriptor(byte[]d,byte tag){if(d==null)return null;for(int i=0;i<d.Length-2;i++)if(d[i]==tag){int p=i+1,n=0;for(int j=0;j<4&&p<d.Length;j++){var q=d[p++];n=(n<<7)|(q&0x7F);if((q&0x80)==0)return p+n<=d.Length?d[p..(p+n)]:null;}}return null;}
-    private static Box? FindBox(byte[]d,string t){foreach(var b in FindBoxes(d,t))return b;return null;}
-    private static IEnumerable<Box> FindBoxes(byte[]d,string t){foreach(var b in Boxes(d)){if(b.Type==t)yield return b;foreach(var c in FindBoxes(b.Payload,t))yield return c;}}
-    private static IEnumerable<Box> Boxes(byte[]d){int p=0;while(p+8<=d.Length){long s=BinaryPrimitives.ReadUInt32BigEndian(d.AsSpan(p,4));var t=Encoding.ASCII.GetString(d,p+4,4);int h=8;if(s==1&&p+16<=d.Length){s=(long)BinaryPrimitives.ReadUInt64BigEndian(d.AsSpan(p+8,8));h=16;}if(s<h||p+s>d.Length)yield break;yield return new Box(t,d.AsSpan(p+h,checked((int)s-h)).ToArray());p+=checked((int)s);}}
-    private readonly record struct Box(string Type,byte[] Payload); private readonly record struct Sample(byte[]Data,ulong Dts,int Cto,bool Sync);
-    private enum Kind{Unknown,Video,Audio} private enum Codec{H264,H265}
-    private sealed class Track{public Kind Kind;public Codec Codec;public uint TimeScale;public int NalLengthSize=4;public byte[]? Asc;public int AacProfile=2,AacFreq=4,SampleRate=44100,Channels=2;public uint TrackId;public uint DefaultSampleDescriptionIndex;public uint TrexDefaultDuration,TrexDefaultSize,TrexDefaultFlags;}
-    private sealed class BoxReader{private readonly Stream s;public BoxReader(Stream s)=>this.s=s;public async Task<Box?> ReadAsync(){var h=new byte[8];var n=await ReadExact(h);if(n==0)return null;if(n<8)throw new EndOfStreamException();long z=BinaryPrimitives.ReadUInt32BigEndian(h.AsSpan(0,4));var t=Encoding.ASCII.GetString(h,4,4);int hs=8;if(z==1){var x=new byte[8];if(await ReadExact(x)!=8)throw new EndOfStreamException();z=(long)BinaryPrimitives.ReadUInt64BigEndian(x);hs=16;}if(z<hs||z>int.MaxValue)throw new InvalidDataException();var p=new byte[(int)z-hs];if(await ReadExact(p)!=p.Length)throw new EndOfStreamException();return new Box(t,p);}private async Task<int>ReadExact(byte[]b){int n=0;while(n<b.Length){var k=await s.ReadAsync(b.AsMemory(n));if(k==0)break;n+=k;}return n;}}
+    private static long ParseTfdt(byte[] p) { if (p.Length < 8) return 0; return p[0] == 1 ? (long)BinaryPrimitives.ReadUInt64BigEndian(p.AsSpan(4, 8)) : BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(4, 4)); }
+    private static uint ReadDefaultDuration(byte[]? p, Track t) => p != null && p.Length >= 16 && (BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(0, 4)) & 8) != 0 ? BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(12, 4)) : t.TrexDefaultDuration;
+    private static uint ReadDefaultSize(byte[]? p, Track t) => p != null && p.Length >= 20 && (BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(0, 4)) & 16) != 0 ? BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(16, 4)) : t.TrexDefaultSize;
+    private static uint ReadDefaultFlags(byte[]? p, Track t) => p != null && p.Length >= 24 && (BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(0, 4)) & 32) != 0 ? BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(20, 4)) : t.TrexDefaultFlags;
+
+    private static byte[] ConvertVideo(byte[] sample, Track t)
+    {
+        var result = new List<byte>(sample.Length + 64); var pos = 0; while (pos + t.NalLengthSize <= sample.Length) { uint n = t.NalLengthSize switch { 1 => sample[pos], 2 => BinaryPrimitives.ReadUInt16BigEndian(sample.AsSpan(pos, 2)), 4 => BinaryPrimitives.ReadUInt32BigEndian(sample.AsSpan(pos, 4)), _ => throw new InvalidDataException("Unsupported NAL length size") }; pos += t.NalLengthSize; if (n > sample.Length - pos) n = (uint)(sample.Length - pos); result.Add(0); result.Add(0); result.Add(0); result.Add(1); result.AddRange(sample.AsSpan(pos, checked((int)n)).ToArray()); pos += checked((int)n); } return result.ToArray();
+    }
+
+    private static byte[] AddAdts(byte[] aac, Track t)
+    {
+        var profile = Math.Max(1, t.AacProfile) - 1; var len = aac.Length + 7; var h = new byte[7]; h[0] = 0xFF; h[1] = 0xF1; h[2] = (byte)((profile << 6) | ((t.AacFreq & 15) << 2) | ((t.Channels >> 2) & 1)); h[3] = (byte)(((t.Channels & 3) << 6) | ((len >> 11) & 3)); h[4] = (byte)((len >> 3) & 0xFF); h[5] = (byte)(((len & 7) << 5) | 0x1F); h[6] = 0xFC; var result = new byte[len]; Buffer.BlockCopy(h, 0, result, 0, 7); Buffer.BlockCopy(aac, 0, result, 7, aac.Length); return result;
+    }
+
+    private static long Scale90(long value, uint scale) => scale == 0 ? 0 : (long)Math.Round(value * 90000.0 / scale);
+
+    private void WritePsi()
+    {
+        var pat = new byte[188]; var pmt = new byte[188]; FillTs(pat, 0, true, ref pmtCc); var p = 4; pat[p++] = 0; pat[p++] = 0xB0; pat[p++] = 0x0D; pat[p++] = 0; pat[p++] = 1; pat[p++] = 0xC1; pat[p++] = 0; pat[p++] = 0; pat[p++] = 0; pat[p++] = 1; pat[p++] = 0xE0; pat[p++] = (byte)(PmtPid & 0xFF); pat[p++] = 0; WriteCrc(pat, 5, p - 5); FillTs(pmt, PmtPid, true, ref pmtCc); p = 4; pmt[p++] = 0; pmt[p++] = 0xB0; pmt[p++] = 0x17; pmt[p++] = 0; pmt[p++] = 1; pmt[p++] = 0xC1; pmt[p++] = 0; pmt[p++] = 0x00; pmt[p++] = 0xE1; pmt[p++] = 0; pmt[p++] = 0xF0; pmt[p++] = 0; pmt[p++] = video?.Codec == Codec.H265 ? (byte)0x24 : (byte)0x1B; pmt[p++] = 0xE1; pmt[p++] = 0; pmt[p++] = 0xF0; pmt[p++] = 0; pmt[p++] = 0x0F; pmt[p++] = 0xE1; pmt[p++] = 1; pmt[p++] = 0xF0; pmt[p++] = 0; WriteCrc(pmt, 5, p - 5);
+        WriteRaw(pat); WriteRaw(pmt);
+    }
+
+    private void WritePes(byte[] payload, int pid, long pts, long dts, bool isVideo, ref int cc)
+    {
+        pesWrites++; var ptsDtsFlags = isVideo && pts != dts ? 3 : 2; var headerLen = ptsDtsFlags == 3 ? 10 : 5; var pesLen = isVideo ? 0 : payload.Length + 3 + headerLen; var pes = new byte[14 + headerLen + payload.Length]; var q = 0; pes[q++] = 0; pes[q++] = 0; pes[q++] = 1; pes[q++] = isVideo ? (byte)0xE0 : (byte)0xC0; pes[q++] = (byte)(pesLen >> 8); pes[q++] = (byte)pesLen; pes[q++] = 0x80; pes[q++] = (byte)(ptsDtsFlags << 6); pes[q++] = (byte)headerLen; PutPts(pes, q, pts, ptsDtsFlags == 3 ? 3 : 2); q += 5; if (ptsDtsFlags == 3) { PutPts(pes, q, dts, 1); q += 5; } Buffer.BlockCopy(payload, 0, pes, q, payload.Length); WriteTsPackets(pes, pid, isVideo, ref cc, pts); }
+
+    private void WriteTsPackets(byte[] pes, int pid, bool payloadUnitStart, ref int cc, long pts)
+    {
+        var pos = 0; var first = true; while (pos < pes.Length) { var ts = new byte[188]; FillTs(ts, pid, first, ref cc); var h = 4; var remain = pes.Length - pos; var cap = 184; if (remain < cap) { ts[3] = (byte)((ts[3] & 0xCF) | 0x30); var stuffing = cap - remain; ts[4] = (byte)(stuffing - 1); if (stuffing > 1) { ts[5] = 0; Array.Fill(ts, (byte)0xFF, 6, stuffing - 1); } h = 5 + stuffing - 1; } Array.Copy(pes, pos, ts, h, Math.Min(remain, 188 - h)); WriteRaw(ts); pos += Math.Min(remain, 188 - h); first = false; }
+    }
+
+    private void FillTs(byte[] ts, int pid, bool pusi, ref int cc)
+    {
+        Array.Fill(ts, (byte)0xFF); ts[0] = 0x47; ts[1] = (byte)((pusi ? 0x40 : 0) | ((pid >> 8) & 0x1F)); ts[2] = (byte)pid; ts[3] = (byte)(0x10 | (cc++ & 0x0F));
+    }
+
+    private void WriteRaw(byte[] ts) { output.Write(ts, 0, ts.Length); tsPacketsWritten++; tsBytesWritten += ts.Length; if ((tsPacketsWritten % 100) == 0) Logger.WarnMarkUp($"[PIPE-TS] raw TS packet #{tsPacketsWritten} bytes={ts.Length} cumulativeTsBytes={tsBytesWritten}"); }
+    private static void WriteCrc(byte[] b, int off, int len) { uint crc = 0xFFFFFFFF; for (var i = off; i < len; i++) { crc ^= (uint)b[i] << 24; for (var j = 0; j < 8; j++) crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ 0x04C11DB7 : crc << 1; } b[len] = (byte)(crc >> 24); b[len + 1] = (byte)(crc >> 16); b[len + 2] = (byte)(crc >> 8); b[len + 3] = (byte)crc; }
+    private static void PutPts(byte[] b, int off, long pts, int prefix) { ulong v = (ulong)Math.Max(0, pts) & ((1UL << 33) - 1); b[off] = (byte)((prefix << 4) | (((v >> 30) & 7) << 1) | 1); b[off + 1] = (byte)(v >> 22); b[off + 2] = (byte)(((v >> 15) & 0x7F) << 1 | 1); b[off + 3] = (byte)(v >> 7); b[off + 4] = (byte)(((v & 0x7F) << 1) | 1); }
+
+    private sealed class BoxReader
+    {
+        private readonly Stream s; public BoxReader(Stream s) => this.s = s;
+        public async Task<Box?> ReadAsync() { var h = new byte[8]; var n = await ReadExact(h); if (n == 0) return null; if (n < 8) throw new EndOfStreamException(); var size = BinaryPrimitives.ReadUInt32BigEndian(h.AsSpan(0, 4)); var type = Encoding.ASCII.GetString(h, 4, 4); long total = size == 1 ? await ReadUInt64() : size; if (total < 8 || total > int.MaxValue) throw new InvalidDataException($"Invalid box size {total} for {type}"); var payload = new byte[checked((int)total - 8)]; await ReadExact(payload); return new Box(type, payload); }
+        private async Task<long> ReadUInt64() { var b = new byte[8]; await ReadExact(b); return checked((long)BinaryPrimitives.ReadUInt64BigEndian(b)); }
+        private async Task<int> ReadExact(byte[] b) { var off = 0; while (off < b.Length) { var n = await s.ReadAsync(b.AsMemory(off)); if (n == 0) break; off += n; } return off; }
+    }
+
+    private readonly record struct Box(string Type, byte[] Payload);
+    private enum Kind { Unknown, Video, Audio }
+    private enum Codec { H264, H265 }
+    private sealed class Track { public Kind Kind; public uint TrackId, TimeScale, TrexDefaultDuration, TrexDefaultSize, TrexDefaultFlags, DefaultSampleDescriptionIndex; public Codec Codec; public int NalLengthSize = 4, AacProfile = 2, AacFreq = 4, Channels = 2; public uint SampleRate = 48000; public byte[] Asc = Array.Empty<byte>(); }
+    private readonly record struct Sample(byte[] Data, long Dts, int Cto, uint Duration, uint Flags);
+
+    private static IEnumerable<Box> Boxes(byte[] data) { var pos = 0; while (pos + 8 <= data.Length) { var size = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(pos, 4)); var type = Encoding.ASCII.GetString(data, pos + 4, 4); if (size < 8 || size > data.Length - pos) yield break; yield return new Box(type, data.AsSpan(pos + 8, checked((int)size - 8)).ToArray()); pos += checked((int)size); } }
+    private static IEnumerable<Box> FindBoxes(byte[] data, string type) => Boxes(data).Where(b => b.Type == type);
+    private static Box? FindBox(byte[] data, string type) => Boxes(data).FirstOrDefault(b => b.Type == type) is var b && b.Payload != null && b.Type == type ? b : null;
+    private static byte[]? FindDescriptor(byte[] data, byte wanted) { for (var i = 4; i + 2 < data.Length; i++) if (data[i] == wanted) { var len = data[i + 1] & 0x7F; if (i + 2 + len <= data.Length) return data.AsSpan(i + 2, len).ToArray(); } return null; }
+    private static uint Frequency(int idx) => idx switch { 0 => 96000, 1 => 88200, 2 => 64000, 3 => 48000, 4 => 44100, 5 => 32000, 6 => 24000, 7 => 22050, 8 => 16000, 9 => 12000, 10 => 11025, 11 => 8000, _ => 48000 };
 }
